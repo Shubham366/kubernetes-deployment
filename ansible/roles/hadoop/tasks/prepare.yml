@@ -1,0 +1,49 @@
+---
+# =============================================================================
+# Node preparation (install / scale_out) - everything that is local to a node
+# and does not depend on other daemons being up.
+#
+# scale_out: only the hosts listed in hadoop_new_nodes get the full treatment
+# (hadoop_node_selected). The existing nodes merely learn about the newcomers:
+# /etc/hosts, SSH client config, firewall source rules and the workers file.
+# Their running daemons are not touched.
+# =============================================================================
+
+- name: Prepare | /etc/hosts entries for every cluster node
+  ansible.builtin.include_tasks: etc_hosts.yml
+  when: hadoop_manage_etc_hosts | bool
+
+- name: Prepare | OS packages and kernel / limits tuning
+  ansible.builtin.include_tasks: os_prereqs.yml
+  when: hadoop_node_selected | bool
+
+- name: Prepare | Firewall
+  ansible.builtin.include_tasks: firewall.yml
+  when: hadoop_manage_firewall | bool
+
+- name: Prepare | Java
+  ansible.builtin.include_tasks: java.yml
+  when: hadoop_node_selected | bool
+
+- name: Prepare | Service account and directories
+  ansible.builtin.include_tasks: user.yml
+  when: hadoop_node_selected | bool
+
+- name: Prepare | Passwordless SSH between the nodes
+  ansible.builtin.include_tasks: ssh.yml
+  when: hadoop_manage_ssh | bool
+
+- name: Prepare | Hadoop binaries
+  ansible.builtin.include_tasks: install.yml
+  when: hadoop_node_selected | bool
+
+- name: Prepare | Configuration files
+  ansible.builtin.include_tasks: config.yml
+  when: hadoop_node_selected | bool
+
+- name: Prepare | Cluster membership files (workers, excludes)
+  ansible.builtin.include_tasks: membership.yml
+
+- name: Prepare | systemd units
+  ansible.builtin.include_tasks: systemd.yml
+  when: hadoop_node_selected | bool

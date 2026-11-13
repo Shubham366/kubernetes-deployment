@@ -1,0 +1,61 @@
+---
+# Opens (or closes) the redis ports in firewalld / ufw, but only when one of
+# them is actually active on the host. No firewall collections are used:
+# plain firewall-cmd / ufw with changed_when derived from their output.
+#
+# Input:
+#   __redis_fw_ports  list of TCP ports (computed in vars/main.yml)
+#   __redis_fw_state  open | closed
+
+- name: Firewall | ports for this host
+  ansible.builtin.debug:
+    msg: "redis firewall ports on {{ inventory_hostname }} -> {{ __redis_fw_state }}: {{ __redis_fw_ports }}"
+
+# ------------------------------- firewalld -----------------------------------
+- name: Firewall | is firewalld running
+  ansible.builtin.command: systemctl is-active firewalld
+  register: __redis_firewalld
+  changed_when: false
+  failed_when: false
+
+- name: Firewall | firewalld
+  when: __redis_firewalld.rc == 0
+  block:
+    # firewall-cmd exits 0 and prints "Warning: ALREADY_ENABLED" (stderr) when
+    # the port is already open, "NOT_ENABLED" when removing a closed one.
+    - name: Firewall | firewalld permanent rules
+      ansible.builtin.command: >-
+        firewall-cmd --permanent
+        --{{ 'add' if __redis_fw_state == 'open' else 'remove' }}-port={{ item }}/tcp
+      loop: "{{ __redis_fw_ports }}"
+      register: __redis_firewalld_rules
+      changed_when:
+        - "'ALREADY_ENABLED' not in __redis_firewalld_rules.stderr"
+        - "'NOT_ENABLED' not in __redis_firewalld_rules.stderr"
+
+    - name: Firewall | firewalld reload
+      ansible.builtin.command: firewall-cmd --reload
+      changed_when: true
+      when: __redis_firewalld_rules is changed
+
+# ---------------------------------- ufw --------------------------------------
+- name: Firewall | is ufw active
+  ansible.builtin.command: ufw status
+  register: __redis_ufw
+  changed_when: false
+  failed_when: false
+
+- name: Firewall | ufw
+  when:
+    - __redis_ufw.rc | default(1) == 0
+    - "'Status: active' in (__redis_ufw.stdout | default(''))"
+  block:
+    # "Skipping adding existing rule" / "Could not delete non-existent rule"
+    - name: Firewall | ufw rules
+      ansible.builtin.command: >-
+        ufw {{ 'allow' if __redis_fw_state == 'open' else 'delete allow' }} {{ item }}/tcp
+      loop: "{{ __redis_fw_ports }}"
+      register: __redis_ufw_rules
+      changed_when:
+        - "'Skipping' not in __redis_ufw_rules.stdout"
+        - "'non-existent' not in __redis_ufw_rules.stdout"

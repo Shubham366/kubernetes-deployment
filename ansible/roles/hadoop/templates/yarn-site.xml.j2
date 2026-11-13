@@ -1,0 +1,89 @@
+{#
+  yarn-site.xml
+  One ResourceManager  -> classic setup.
+  Two or more          -> ResourceManager HA (rm1..rmN in inventory order) with
+                          ZooKeeper based election and state store.
+  NodeManager resources default to 75% of this host's RAM / all its vCPUs
+  unless hadoop_yarn_nodemanager_memory_mb / _vcores are given.
+#}
+{% set props = {
+  'yarn.nodemanager.aux-services': 'mapreduce_shuffle',
+  'yarn.nodemanager.aux-services.mapreduce_shuffle.class': 'org.apache.hadoop.mapred.ShuffleHandler',
+  'yarn.nodemanager.resource.memory-mb': hadoop_nm_memory_mb | int,
+  'yarn.nodemanager.resource.cpu-vcores': hadoop_nm_vcores | int,
+  'yarn.scheduler.minimum-allocation-mb': hadoop_yarn_scheduler_min_mb | int,
+  'yarn.scheduler.maximum-allocation-mb': hadoop_nm_memory_mb | int,
+  'yarn.scheduler.maximum-allocation-vcores': hadoop_nm_vcores | int,
+  'yarn.nodemanager.local-dirs': hadoop_yarn_local_dirs | join(','),
+  'yarn.nodemanager.log-dirs': hadoop_yarn_log_dirs | join(','),
+  'yarn.nodemanager.vmem-check-enabled': false,
+  'yarn.nodemanager.address': '0.0.0.0:' ~ hadoop_ports.nm_ipc,
+  'yarn.nodemanager.localizer.address': '0.0.0.0:' ~ hadoop_ports.nm_localizer,
+  'yarn.nodemanager.webapp.address': '0.0.0.0:' ~ hadoop_ports.nm_web,
+  'yarn.nodemanager.bind-host': '0.0.0.0',
+  'yarn.resourcemanager.bind-host': '0.0.0.0',
+  'yarn.resourcemanager.nodes.exclude-path': hadoop_yarn_exclude_file,
+  'yarn.nodemanager.env-whitelist': 'JAVA_HOME,HADOOP_COMMON_HOME,HADOOP_HDFS_HOME,HADOOP_CONF_DIR,CLASSPATH_PREPEND_DISTCACHE,HADOOP_YARN_HOME,HADOOP_HOME,PATH,LANG,TZ,HADOOP_MAPRED_HOME',
+  'yarn.log-aggregation-enable': hadoop_yarn_log_aggregation | bool,
+  'yarn.nodemanager.remote-app-log-dir': hadoop_yarn_remote_log_dir,
+  'yarn.log-aggregation.retain-seconds': 604800,
+  'yarn.resourcemanager.cluster-id': hadoop_cluster_name ~ '-yarn'
+} %}
+{% if inventory_hostname in hadoop_dn_hosts %}
+{%   set _ = props.update({'yarn.nodemanager.hostname': hadoop_self_addr}) %}
+{% endif %}
+{% if hadoop_jhs_addrs | length > 0 %}
+{%   set _ = props.update({'yarn.log.server.url': 'http://' ~ hadoop_jhs_addrs[0] ~ ':' ~ hadoop_ports.jhs_web ~ '/jobhistory/logs'}) %}
+{% endif %}
+{% if hadoop_rm_ha | bool %}
+{#   ---- ResourceManager HA ------------------------------------------------ #}
+{%   set rm_ids = [] %}
+{%   for h in hadoop_rm_hosts %}
+{%     set rm_id = 'rm' ~ loop.index %}
+{%     set rm_host = hadoop_node_map[h].name %}
+{%     set _ = rm_ids.append(rm_id) %}
+{%     set _ = props.update({
+  'yarn.resourcemanager.hostname.' ~ rm_id: rm_host,
+  'yarn.resourcemanager.address.' ~ rm_id: rm_host ~ ':' ~ hadoop_ports.rm_client,
+  'yarn.resourcemanager.scheduler.address.' ~ rm_id: rm_host ~ ':' ~ hadoop_ports.rm_scheduler,
+  'yarn.resourcemanager.resource-tracker.address.' ~ rm_id: rm_host ~ ':' ~ hadoop_ports.rm_tracker,
+  'yarn.resourcemanager.admin.address.' ~ rm_id: rm_host ~ ':' ~ hadoop_ports.rm_admin,
+  'yarn.resourcemanager.webapp.address.' ~ rm_id: rm_host ~ ':' ~ hadoop_ports.rm_web
+}) %}
+{%     if h == inventory_hostname %}
+{%       set _ = props.update({'yarn.resourcemanager.ha.id': rm_id}) %}
+{%     endif %}
+{%   endfor %}
+{%   set _ = props.update({
+  'yarn.resourcemanager.ha.enabled': true,
+  'yarn.resourcemanager.ha.rm-ids': rm_ids | join(','),
+  'yarn.resourcemanager.ha.automatic-failover.enabled': true,
+  'yarn.resourcemanager.recovery.enabled': true,
+  'yarn.resourcemanager.store.class': 'org.apache.hadoop.yarn.server.resourcemanager.recovery.ZKRMStateStore',
+  'yarn.resourcemanager.zk-address': hadoop_zk_quorum
+}) %}
+{% elif hadoop_rm_addrs | length > 0 %}
+{#   ---- single ResourceManager -------------------------------------------- #}
+{%   set rm_host = hadoop_rm_addrs[0] %}
+{%   set _ = props.update({
+  'yarn.resourcemanager.hostname': rm_host,
+  'yarn.resourcemanager.address': rm_host ~ ':' ~ hadoop_ports.rm_client,
+  'yarn.resourcemanager.scheduler.address': rm_host ~ ':' ~ hadoop_ports.rm_scheduler,
+  'yarn.resourcemanager.resource-tracker.address': rm_host ~ ':' ~ hadoop_ports.rm_tracker,
+  'yarn.resourcemanager.admin.address': rm_host ~ ':' ~ hadoop_ports.rm_admin,
+  'yarn.resourcemanager.webapp.address': rm_host ~ ':' ~ hadoop_ports.rm_web
+}) %}
+{% endif %}
+{% set _ = props.update(hadoop_extra_yarn_site | default({}, true)) %}
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<!-- {{ ansible_managed }} -->
+<!-- Generated for {{ inventory_hostname }} - cluster {{ hadoop_cluster_name }}. Local edits are overwritten. -->
+<configuration>
+{% for name, value in props | dictsort %}
+  <property>
+    <name>{{ name }}</name>
+    <value>{{ (value | string | lower) if value is boolean else (value | string | e) }}</value>
+  </property>
+{% endfor %}
+</configuration>

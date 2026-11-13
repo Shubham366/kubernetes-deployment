@@ -1,0 +1,64 @@
+---
+# =============================================================================
+# Rolling restart of the given daemons on this host (hadoop_action=restart).
+#
+# The playbook runs this with `serial`, so only one host (or one batch of
+# workers) is down at any time. After the restart this file waits until the
+# daemon is not just listening but actually back in service, so the next host
+# is only touched when this one is healthy again:
+#
+#   NameNode  -> out of safe mode (with HA, ZKFC fails over to the peer while
+#                this one restarts and it rejoins as standby)
+#   DataNode  -> registered as live with the NameNode
+#
+# Parameter: hadoop_svc_daemons (list)
+# =============================================================================
+
+- name: Rolling | Restart
+  ansible.builtin.include_tasks: services.yml
+  vars:
+    hadoop_svc_state: restarted
+
+- name: Rolling | Wait for this NameNode to leave safe mode
+  ansible.builtin.command:
+    cmd: >-
+      {{ hadoop_hdfs }} dfsadmin
+      -fs hdfs://{{ hadoop_self_addr }}:{{ hadoop_ports.namenode_rpc }}
+      -safemode get
+  become: true
+  become_user: "{{ hadoop_user }}"
+  register: hadoop_rolling_safemode
+  changed_when: false
+  until: hadoop_rolling_safemode.rc == 0 and 'Safe mode is OFF' in hadoop_rolling_safemode.stdout
+  retries: "{{ hadoop_safemode_wait_retries }}"
+  delay: "{{ hadoop_safemode_wait_delay }}"
+  when:
+    - "'namenode' in hadoop_svc_daemons"
+    - inventory_hostname in hadoop_nn_hosts
+
+- name: Rolling | Wait for this DataNode to be live again
+  ansible.builtin.command:
+    cmd: "{{ hadoop_hdfs }} dfsadmin -report -live"
+  become: true
+  become_user: "{{ hadoop_user }}"
+  register: hadoop_rolling_live
+  changed_when: false
+  until: >-
+    hadoop_rolling_live.rc == 0 and
+    (hadoop_self_addr in hadoop_rolling_live.stdout
+     or (hadoop_node_map[inventory_hostname].ip | length > 0
+         and (hadoop_node_map[inventory_hostname].ip ~ ':') in hadoop_rolling_live.stdout))
+  retries: 30
+  delay: 10
+  when:
+    - "'datanode' in hadoop_svc_daemons"
+    - inventory_hostname in hadoop_dn_hosts
+
+# Per-host breathing space before the next batch (wait_for with only a
+# timeout is a plain sleep that, unlike pause, works per host).
+- name: Rolling | Settle before the next host
+  ansible.builtin.wait_for:
+    timeout: "{{ hadoop_rolling_restart_pause | int }}"
+  when:
+    - (hadoop_rolling_restart_pause | int) > 0
+    - hadoop_svc_daemons | select('in', hadoop_host_daemons) | list | length > 0

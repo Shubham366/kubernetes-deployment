@@ -1,0 +1,95 @@
+---
+# =============================================================================
+# Cluster-wide status (hadoop_action=status) - read-only, runs once on the
+# primary NameNode, which has the full client configuration.
+#
+# Every command tolerates failure: status must still print what it can when
+# half the cluster is down.
+# =============================================================================
+
+- name: Cluster status | HDFS report (hdfs dfsadmin -report)
+  ansible.builtin.command:
+    cmd: "{{ hadoop_hdfs }} dfsadmin -report"
+  become: true
+  become_user: "{{ hadoop_user }}"
+  register: hadoop_cs_report
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Cluster status | Safe mode
+  ansible.builtin.command:
+    cmd: "{{ hadoop_hdfs }} dfsadmin -safemode get"
+  become: true
+  become_user: "{{ hadoop_user }}"
+  register: hadoop_cs_safemode
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Cluster status | NameNode HA state
+  ansible.builtin.command:
+    cmd: "{{ hadoop_hdfs }} haadmin -getAllServiceState"
+  become: true
+  become_user: "{{ hadoop_user }}"
+  register: hadoop_cs_ha
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: hadoop_ha | bool
+
+- name: Cluster status | YARN nodes
+  ansible.builtin.command:
+    cmd: "{{ hadoop_yarn }} node -list -all"
+  become: true
+  become_user: "{{ hadoop_user }}"
+  register: hadoop_cs_yarn_nodes
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: hadoop_yarn_enabled | bool
+
+- name: Cluster status | ResourceManager HA state
+  ansible.builtin.command:
+    cmd: "{{ hadoop_yarn }} rmadmin -getAllServiceState"
+  become: true
+  become_user: "{{ hadoop_user }}"
+  register: hadoop_cs_rm_ha
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: hadoop_rm_ha | bool
+
+- name: Cluster status | Hadoop version
+  ansible.builtin.command:
+    cmd: "{{ hadoop_current }}/bin/hadoop --config {{ hadoop_conf_dir }} version"
+  become: true
+  become_user: "{{ hadoop_user }}"
+  register: hadoop_cs_version
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Cluster status | Summary
+  ansible.builtin.debug:
+    msg:
+      HADOOP_CLUSTER_STATUS:
+        cluster: "{{ hadoop_cluster_name }}"
+        default_fs: "{{ hadoop_default_fs }}"
+        ha_enabled: "{{ hadoop_ha | bool }}"
+        version: "{{ hadoop_cs_version.stdout_lines | default([]) | first | default('unknown') }}"
+        hdfs_reachable: "{{ (hadoop_cs_report.rc | default(1)) == 0 }}"
+        safemode: "{{ hadoop_cs_safemode.stdout_lines | default([]) }}"
+        namenode_ha_state: "{{ hadoop_cs_ha.stdout_lines | default([]) }}"
+        resourcemanager_ha_state: "{{ hadoop_cs_rm_ha.stdout_lines | default([]) }}"
+        live_datanodes: "{{ hadoop_cs_report.stdout | default('') | regex_findall('Live datanodes \\((\\d+)\\)') | first | default('unknown') }}"
+        dead_datanodes: "{{ hadoop_cs_report.stdout | default('') | regex_findall('Dead datanodes \\((\\d+)\\)') | first | default('0') }}"
+
+- name: Cluster status | hdfs dfsadmin -report
+  ansible.builtin.debug:
+    msg: "{{ (hadoop_cs_report.stdout_lines | default([])) + (hadoop_cs_report.stderr_lines | default([]) if (hadoop_cs_report.rc | default(1)) != 0 else []) }}"
+
+- name: Cluster status | yarn node -list -all
+  ansible.builtin.debug:
+    msg: "{{ hadoop_cs_yarn_nodes.stdout_lines | default([]) }}"
+  when: hadoop_yarn_enabled | bool

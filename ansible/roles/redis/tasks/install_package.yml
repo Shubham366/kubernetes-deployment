@@ -1,0 +1,69 @@
+---
+# Distro package install. The version is whatever the distribution (or EPEL)
+# ships; redis_version is only compared and reported, not enforced.
+
+- name: Package | Debian family
+  when: ansible_os_family == 'Debian'
+  block:
+    - name: Package | apt install redis
+      ansible.builtin.apt:
+        name: >-
+          {{ __redis_os_packages
+             + (__redis_os_sentinel_packages if (__redis_is_sentinel and redis_mode == 'sentinel') else []) }}
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      register: __redis_pkg_apt
+      retries: 3
+      delay: 10
+      until: __redis_pkg_apt is succeeded
+
+- name: Package | RedHat family
+  when: ansible_os_family == 'RedHat'
+  block:
+    # EL7 has no redis in base/updates, only in EPEL.
+    - name: Package | EPEL (EL7)
+      ansible.builtin.package:
+        name: epel-release
+        state: present
+      when: ansible_distribution_major_version | int <= 7
+
+    - name: Package | install redis
+      ansible.builtin.package:
+        name: "{{ __redis_os_packages }}"
+        state: present
+      register: __redis_pkg_yum
+      retries: 3
+      delay: 10
+      until: __redis_pkg_yum is succeeded
+
+# The packages ship (and on Debian auto-start) their own units listening on
+# 6379. We run our own per-port units, so the distro ones are stopped and
+# masked. Units that do not exist on this distro are simply ignored.
+- name: Package | stop and mask distro units
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: false
+    masked: true
+  loop: "{{ __redis_os_distro_services }}"
+  register: __redis_mask
+  failed_when:
+    - __redis_mask is failed
+    - "'Could not find' not in (__redis_mask.msg | default(''))"
+    - "'not found' not in (__redis_mask.msg | default(''))"
+    - "'does not exist' not in (__redis_mask.msg | default(''))"
+
+- name: Package | packaged version
+  ansible.builtin.command: /usr/bin/redis-server --version
+  register: __redis_pkg_version
+  changed_when: false
+
+- name: Package | warn when the packaged version differs from redis_version
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: redis_install_method=package installed
+      {{ __redis_pkg_version.stdout | regex_search('v=([0-9.]+)', '\1') | first | default('unknown') }}
+      but redis_version={{ redis_version }} was requested. Use redis_install_method=source
+      to get the exact version.
+  when: ('v=' ~ redis_version ~ ' ') not in __redis_pkg_version.stdout

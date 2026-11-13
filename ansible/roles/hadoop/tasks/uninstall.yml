@@ -1,0 +1,173 @@
+---
+# =============================================================================
+# Uninstall (hadoop_action=uninstall). The playbook has already stopped every
+# daemon (stop_all.yml) before this file runs.
+#
+# Always removed : systemd units, binaries, configuration, profile.d, sysctl /
+#                  limits / tmpfiles drop-ins, THP unit, /etc/hosts block,
+#                  logs (hadoop_remove_logs)
+# Only with hadoop_purge_data=true :
+#                  HDFS block storage, NameNode metadata, JournalNode edits,
+#                  checkpoints, YARN scratch dirs, ZooKeeper data, the format
+#                  marker
+# Only with hadoop_remove_user=true (defaults to hadoop_purge_data) :
+#                  the hadoop / zookeeper accounts (and the SSH keys with them)
+#
+# Keeping the data means a later `install` finds formatted metadata and simply
+# starts the existing filesystem again - nothing is reformatted.
+# Firewall rules are left in place on purpose (closing ports is harmless to
+# skip and could collide with other software using the same ports).
+# validate.yml has already refused paths that are dangerously short.
+# =============================================================================
+
+- name: Uninstall | Disable every Hadoop unit
+  ansible.builtin.systemd:
+    name: "{{ item }}.service"
+    state: stopped
+    enabled: false
+  loop: "{{ hadoop_all_units + ['zookeeper', 'hadoop-disable-thp'] }}"
+  register: hadoop_uninstall_units
+  # Units that were never installed on this host are not an error.
+  failed_when: false
+
+# Anything that survived a failed/slow unit stop (also covers daemons that
+# were started by hand with the stock scripts).
+- name: Uninstall | Kill leftover Hadoop JVMs
+  ansible.builtin.shell: |
+    pids=$(pgrep -u {{ hadoop_user | quote }} -f 'org\.apache\.hadoop' 2>/dev/null) || exit 0
+    [ -z "$pids" ] && exit 0
+    kill $pids 2>/dev/null; sleep 5; kill -9 $pids 2>/dev/null
+    echo HADOOP_KILLED
+  args:
+    executable: /bin/sh
+  register: hadoop_uninstall_kill
+  changed_when: "'HADOOP_KILLED' in hadoop_uninstall_kill.stdout"
+  failed_when: false
+
+- name: Uninstall | Remove unit files
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ item }}.service"
+    state: absent
+  loop: "{{ hadoop_all_units + ['zookeeper', 'hadoop-disable-thp'] }}"
+  register: hadoop_uninstall_unit_files
+
+- name: Uninstall | Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: hadoop_uninstall_unit_files is changed
+
+# The marker lives inside the install dir; preserve it when data is kept so a
+# re-install still knows the NameNode is formatted even if the name directory
+# sits on a volume that is temporarily unmounted.
+- name: Uninstall | Remove the Hadoop releases and download cache
+  ansible.builtin.shell: |
+    cd {{ hadoop_install_dir | quote }} 2>/dev/null || exit 0
+    found=0
+    for e in hadoop-* current dist; do
+      if [ -e "$e" ] || [ -L "$e" ]; then rm -rf -- "$e"; found=1; fi
+    done
+    [ "$found" = 1 ] && echo HADOOP_REMOVED
+    exit 0
+  args:
+    executable: /bin/sh
+  register: hadoop_uninstall_bins
+  changed_when: "'HADOOP_REMOVED' in hadoop_uninstall_bins.stdout"
+
+- name: Uninstall | Remove configuration and system drop-ins
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ hadoop_conf_dir }}"
+    - /etc/profile.d/hadoop.sh
+    - /etc/sysctl.d/90-hadoop.conf
+    - /etc/security/limits.d/90-hadoop.conf
+    - /etc/tmpfiles.d/hadoop.conf
+    - "{{ hadoop_pid_dir }}"
+    - "{{ hadoop_zookeeper_install_dir }}"
+    - "{{ hadoop_zookeeper_conf_dir }}"
+
+# /etc/hadoop is only removed when we emptied it (conf_dir default is /etc/hadoop/conf).
+- name: Uninstall | Remove the now-empty parent of the configuration directory
+  ansible.builtin.command:
+    cmd: "rmdir {{ hadoop_conf_dir | dirname }} {{ hadoop_zookeeper_conf_dir | dirname }}"
+  register: hadoop_uninstall_rmdir
+  changed_when: hadoop_uninstall_rmdir.rc == 0
+  failed_when: false
+  when:
+    - (hadoop_conf_dir | dirname) is match('^/etc/[^/]+')
+    - (hadoop_zookeeper_conf_dir | dirname) is match('^/etc/[^/]+')
+
+- name: Uninstall | Remove logs
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ hadoop_log_dir }}"
+    - "{{ hadoop_zookeeper_log_dir }}"
+  when: hadoop_remove_logs | bool
+
+- name: Uninstall | Remove the cluster block from /etc/hosts
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    marker: "# {mark} HADOOP CLUSTER {{ hadoop_cluster_name }} (managed by ansible)"
+    state: absent
+  when: hadoop_manage_etc_hosts | bool
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
+- name: Uninstall | Data is kept
+  ansible.builtin.debug:
+    msg: >-
+      hadoop_purge_data=false: keeping {{ hadoop_all_storage_dirs | join(', ') }},
+      {{ hadoop_zookeeper_data_dir }} and the format marker on {{ inventory_hostname }}.
+      Re-run with hadoop_purge_data=true to delete them.
+  when: not (hadoop_purge_data | bool)
+
+- name: Uninstall | PURGE HDFS / YARN / JournalNode data
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: "{{ hadoop_all_storage_dirs + [hadoop_zookeeper_data_dir, hadoop_format_marker] }}"
+  when: hadoop_purge_data | bool
+
+- name: Uninstall | Remove the install directory when nothing is left in it
+  ansible.builtin.command:
+    cmd: "rmdir {{ hadoop_install_dir }}"
+  register: hadoop_uninstall_rmdir_install
+  changed_when: hadoop_uninstall_rmdir_install.rc == 0
+  failed_when: false
+
+# ---------------------------------------------------------------------------
+# Accounts
+# ---------------------------------------------------------------------------
+- name: Uninstall | Remove the service accounts
+  ansible.builtin.user:
+    name: "{{ item }}"
+    state: absent
+    remove: true
+    force: true
+  loop: "{{ [hadoop_user, hadoop_zookeeper_user] | unique }}"
+  when: hadoop_remove_user | bool
+  # userdel fails while stray processes still run as the user.
+  register: hadoop_uninstall_users
+  retries: 2
+  delay: 5
+  until: hadoop_uninstall_users is succeeded
+
+- name: Uninstall | Remove the service groups
+  ansible.builtin.group:
+    name: "{{ item }}"
+    state: absent
+  loop: "{{ [hadoop_group, hadoop_zookeeper_group] | unique }}"
+  when: hadoop_remove_user | bool
+  failed_when: false
+
+- name: Uninstall | Done
+  ansible.builtin.debug:
+    msg: >-
+      Hadoop removed from {{ inventory_hostname }}
+      (data {{ 'purged' if hadoop_purge_data | bool else 'kept' }},
+      accounts {{ 'removed' if hadoop_remove_user | bool else 'kept' }}).
+      Installed OS packages (JDK, chrony, tools) and firewall rules were left in place.

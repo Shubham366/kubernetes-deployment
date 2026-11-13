@@ -1,0 +1,58 @@
+---
+# promote, step 1: stop the old primary so that two primaries can never accept
+# writes at the same time (split brain).
+#
+# A promote is usually done BECAUSE the primary is dead, so an unreachable
+# host must not fail the run: the play sets ignore_unreachable and everything
+# after the fact gathering is skipped when the host did not answer. In that
+# case it is the operator's job to make sure the old primary stays down (or
+# is rebuilt as a replica) before it is powered on again.
+
+- name: Fence | try to reach the old primary
+  ansible.builtin.setup:
+  register: __pg_fence_facts
+  ignore_unreachable: true
+  ignore_errors: true
+
+- name: Fence | old primary is unreachable
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: old primary {{ inventory_hostname }} is unreachable and could NOT be stopped.
+      Make sure it does not come back as a primary: rebuild it as a replica of
+      {{ postgresql_promote_host }} (postgresql_force_resync=true) before starting it again.
+  when: __pg_fence_facts is unreachable or __pg_fence_facts is failed
+
+- name: Fence | stop the old primary
+  when:
+    - __pg_fence_facts is not unreachable
+    - __pg_fence_facts is not failed
+  block:
+    - name: Fence | load variables
+      ansible.builtin.include_tasks: setup_vars.yml
+
+    # A clean ("fast") shutdown writes a shutdown checkpoint and ships the
+    # remaining WAL to connected standbys before exiting, so the standby being
+    # promoted has everything the primary committed.
+    - name: Fence | stop {{ __pg_service }}
+      ansible.builtin.systemd:
+        name: "{{ __pg_service }}"
+        state: stopped
+      register: __pg_fence_stop
+      failed_when:
+        - __pg_fence_stop is failed
+        - "'Could not find' not in (__pg_fence_stop.msg | default(''))"
+        - "'not found' not in (__pg_fence_stop.msg | default(''))"
+
+    # Keep it from coming back as a second primary after a reboot.
+    - name: Fence | disable start at boot
+      ansible.builtin.systemd:
+        name: "{{ __pg_os_enable_service }}"
+        enabled: false
+      failed_when: false
+
+    - name: Fence | result
+      ansible.builtin.debug:
+        msg: >-
+          Old primary {{ inventory_hostname }} stopped and disabled. To bring it back as a replica of
+          the new primary: move it to postgresql_replica in the inventory and run
+          postgresql_action=add_replica with postgresql_force_resync=true.

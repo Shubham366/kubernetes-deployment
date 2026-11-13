@@ -1,0 +1,49 @@
+---
+# =============================================================================
+# Cluster membership files - rendered on every node, for every action that
+# changes who is in the cluster (install, scale_out, decommission).
+#
+#   workers        list of DataNode/NodeManager hosts (used by the stock
+#                  start-*.sh scripts; the daemons themselves do not read it,
+#                  so changing it never requires a restart)
+#   dfs.exclude    DataNodes being / having been decommissioned
+#   yarn.exclude   NodeManagers being / having been decommissioned
+#
+# The exclude files are created empty and afterwards only ever *appended* to
+# by the decommission action. They are deliberately not regenerated from the
+# inventory: wiping an exclude entry would silently recommission a node.
+# =============================================================================
+
+- name: Membership | workers
+  ansible.builtin.template:
+    src: workers.j2
+    dest: "{{ hadoop_conf_dir }}/workers"
+    owner: "{{ hadoop_user }}"
+    group: "{{ hadoop_group }}"
+    mode: "0644"
+
+- name: Membership | Create the exclude files when missing
+  ansible.builtin.template:
+    src: dfs.exclude.j2
+    dest: "{{ item }}"
+    owner: "{{ hadoop_user }}"
+    group: "{{ hadoop_group }}"
+    mode: "0644"
+    force: false
+  loop:
+    - "{{ hadoop_exclude_file }}"
+    - "{{ hadoop_yarn_exclude_file }}"
+
+# Both the name and the IP are listed: the NameNode matches exclude entries
+# against whatever the DataNode registered with.
+- name: Membership | Add the nodes being decommissioned to the exclude files
+  ansible.builtin.lineinfile:
+    path: "{{ item.0 }}"
+    line: "{{ item.1 }}"
+    owner: "{{ hadoop_user }}"
+    group: "{{ hadoop_group }}"
+    mode: "0644"
+  loop: "{{ [hadoop_exclude_file, hadoop_yarn_exclude_file] | product(hadoop_decom_entries) | list }}"
+  loop_control:
+    label: "{{ item.0 | basename }}: {{ item.1 }}"
+  when: hadoop_action == 'decommission'

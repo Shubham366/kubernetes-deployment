@@ -1,0 +1,29 @@
+---
+# Restart one sentinel (the playbook runs this with serial: 1 so a quorum of
+# sentinels is always up) and wait until it sees the master again.
+
+- name: Restart sentinel | load variables
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Restart sentinel | restart {{ __redis_sentinel_service }}
+  ansible.builtin.systemd:
+    name: "{{ __redis_sentinel_service }}"
+    state: restarted
+    daemon_reload: true
+
+- name: Restart sentinel | wait for the port
+  ansible.builtin.wait_for:
+    host: "{{ __redis_cli_host }}"
+    port: "{{ redis_sentinel_port | int }}"
+    timeout: 60
+
+- name: Restart sentinel | wait until the master is seen as healthy
+  ansible.builtin.command: "{{ __redis_sentinel_cli }} sentinel master {{ redis_sentinel_master_name }}"
+  register: __redis_sentinel_after
+  changed_when: false
+  retries: 30
+  delay: 2
+  until:
+    - __redis_sentinel_after.rc == 0
+    - "'s_down' not in __redis_sentinel_after.stdout"
+    - "'o_down' not in __redis_sentinel_after.stdout"

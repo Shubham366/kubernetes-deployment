@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# {{ ansible_managed }}
+# hadoop-env.sh for {{ inventory_hostname }} - cluster {{ hadoop_cluster_name }}
+# Sourced by every hadoop/hdfs/yarn/mapred command and by the systemd units.
+
+export JAVA_HOME="{{ hadoop_java_home_resolved }}"
+export HADOOP_HOME="{{ hadoop_current }}"
+export HADOOP_CONF_DIR="{{ hadoop_conf_dir }}"
+export HADOOP_LOG_DIR="{{ hadoop_log_dir }}"
+export HADOOP_PID_DIR="{{ hadoop_pid_dir }}"
+export HADOOP_OS_TYPE="${HADOOP_OS_TYPE:-$(uname -s)}"
+
+# Default max heap for anything without a dedicated setting below
+# (clients, balancer, fsck ...).
+export HADOOP_HEAPSIZE_MAX="{{ hadoop_heap_size_mb | default(1024, true) | int }}m"
+export HADOOP_HEAPSIZE_MIN="256m"
+
+# IPv4 only: on dual-stack hosts the daemons otherwise bind to IPv6 wildcard
+# sockets, which confuses address matching between the nodes.
+{% set java_major = hadoop_java_version | int %}
+{% set base_opts = ['-Djava.net.preferIPv4Stack=true'] %}
+{% if java_major >= 17 %}
+{# Hadoop 3.3 still reflects into JDK internals that Java 17+ closes by default. #}
+{%   set _ = base_opts.extend([
+  '--add-opens=java.base/java.lang=ALL-UNNAMED',
+  '--add-opens=java.base/java.lang.reflect=ALL-UNNAMED',
+  '--add-opens=java.base/java.net=ALL-UNNAMED',
+  '--add-opens=java.base/java.nio=ALL-UNNAMED',
+  '--add-opens=java.base/java.util=ALL-UNNAMED',
+  '--add-opens=java.base/java.util.concurrent=ALL-UNNAMED',
+  '--add-opens=java.base/sun.nio.ch=ALL-UNNAMED',
+  '--add-opens=java.base/sun.security.util=ALL-UNNAMED'
+]) %}
+{% endif %}
+{% if hadoop_extra_java_opts | default('', true) | length > 0 %}
+{%   set _ = base_opts.append(hadoop_extra_java_opts) %}
+{% endif %}
+export HADOOP_OPTS="${HADOOP_OPTS:-} {{ base_opts | join(' ') }}"
+
+{# G1 is the default collector from Java 9 on; only Java 8 needs the flag. #}
+{% set gc = '-XX:+UseG1GC ' if java_major == 8 else '' %}
+# Per-daemon heap sizes (an explicit -Xmx overrides HADOOP_HEAPSIZE_MAX).
+export HDFS_NAMENODE_OPTS="{{ gc }}-Xms{{ hadoop_namenode_heap_mb | int }}m -Xmx{{ hadoop_namenode_heap_mb | int }}m -Dhadoop.security.logger=INFO,RFAS ${HDFS_NAMENODE_OPTS:-}"
+export HDFS_SECONDARYNAMENODE_OPTS="{{ gc }}-Xmx{{ hadoop_namenode_heap_mb | int }}m -Dhadoop.security.logger=INFO,RFAS ${HDFS_SECONDARYNAMENODE_OPTS:-}"
+export HDFS_DATANODE_OPTS="{{ gc }}-Xmx{{ hadoop_datanode_heap_mb | int }}m -Dhadoop.security.logger=ERROR,RFAS ${HDFS_DATANODE_OPTS:-}"
+export HDFS_JOURNALNODE_OPTS="-Xmx{{ hadoop_journalnode_heap_mb | int }}m ${HDFS_JOURNALNODE_OPTS:-}"
+export HDFS_ZKFC_OPTS="-Xmx{{ hadoop_zkfc_heap_mb | int }}m ${HDFS_ZKFC_OPTS:-}"
+export YARN_RESOURCEMANAGER_OPTS="{{ gc }}-Xmx{{ hadoop_resourcemanager_heap_mb | int }}m ${YARN_RESOURCEMANAGER_OPTS:-}"
+export YARN_NODEMANAGER_OPTS="{{ gc }}-Xmx{{ hadoop_nodemanager_heap_mb | int }}m ${YARN_NODEMANAGER_OPTS:-}"
+export MAPRED_HISTORYSERVER_OPTS="-Xmx{{ hadoop_historyserver_heap_mb | int }}m ${MAPRED_HISTORYSERVER_OPTS:-}"
+
+# Accounts used when the stock start-dfs.sh / start-yarn.sh helpers are run
+# as root (the systemd units already run as {{ hadoop_user }}).
+export HDFS_NAMENODE_USER="{{ hadoop_user }}"
+export HDFS_DATANODE_USER="{{ hadoop_user }}"
+export HDFS_SECONDARYNAMENODE_USER="{{ hadoop_user }}"
+export HDFS_JOURNALNODE_USER="{{ hadoop_user }}"
+export HDFS_ZKFC_USER="{{ hadoop_user }}"
+export YARN_RESOURCEMANAGER_USER="{{ hadoop_user }}"
+export YARN_NODEMANAGER_USER="{{ hadoop_user }}"
+export MAPRED_HISTORYSERVER_USER="{{ hadoop_user }}"
+
+# The helper scripts ssh to the workers as the hadoop user with the cluster key.
+export HADOOP_SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10"

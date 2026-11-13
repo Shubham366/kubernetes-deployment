@@ -1,0 +1,33 @@
+---
+# Extensions on the primary (replicas receive them through replication).
+#
+# Only extensions whose files are already installed can be created: contrib
+# is part of the server package on Debian and installed explicitly on RedHat;
+# anything else (PostGIS, pgvector, ...) must be listed in
+# postgresql_extra_packages. Extensions that need a preload library (e.g.
+# pg_stat_statements) additionally need
+# postgresql_extra_config: {shared_preload_libraries: "pg_stat_statements"}.
+
+- name: Extensions | already installed?
+  ansible.builtin.command: "{{ __pg_psql_base }} -d {{ item.database | default('postgres', true) }}"
+  args:
+    stdin: "SELECT count(*) FROM pg_catalog.pg_extension WHERE extname = '{{ item.name }}';"
+  become: true
+  become_user: postgres
+  loop: "{{ postgresql_extensions }}"
+  loop_control:
+    label: "{{ item.name }} in {{ item.database | default('postgres', true) }}"
+  register: __pg_ext_check
+  changed_when: false
+
+- name: Extensions | create missing extensions
+  ansible.builtin.command: "{{ __pg_psql_base }} -d {{ item.item.database | default('postgres', true) }}"
+  args:
+    stdin: 'CREATE EXTENSION IF NOT EXISTS "{{ item.item.name }}";'
+  become: true
+  become_user: postgres
+  loop: "{{ __pg_ext_check.results }}"
+  loop_control:
+    label: "{{ item.item.name }} in {{ item.item.database | default('postgres', true) }}"
+  changed_when: true
+  when: (item.stdout | trim) == '0'

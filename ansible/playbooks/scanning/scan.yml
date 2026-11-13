@@ -1,0 +1,293 @@
+---
+# =============================================================================
+# scan.yml - vulnerability / compliance / inventory scan of Linux hosts
+#
+# Extra vars
+#   target_hosts        host pattern (default: all)
+#   scan_id             (required) identifier echoed back in every report
+#   scan_type           full | vulnerability | compliance | inventory (default: full)
+#   scan_output_dir     (required) controller-local directory; the report of
+#                       each host lands at <scan_output_dir>/<inventory_hostname>.json
+#   scan_refresh_cache  bool, default true - refresh apt/yum/dnf metadata first
+#   scan_timeout        seconds the scan script may run (default 1800)
+#
+# Host vars used: ansible_host, node_id, declared_os (informational only)
+#
+# Flow per host
+#   gather minimal facts -> pick the distro script -> copy scan_common.sh and
+#   scan_<distro>.sh to /var/lib/provisioner/scripts/scan -> run -> fetch the
+#   JSON report (flat) -> validate it on the controller.
+#
+# A host that cannot be scanned (unreachable, unsupported distribution, script
+# failure ...) still gets a schema-conformant report on the controller with the
+# reason in "errors", and is then marked failed so that the play recap and the
+# ansible-playbook exit code reflect it.
+# =============================================================================
+
+- name: Scan Linux hosts
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+  become: true
+  any_errors_fatal: false
+
+  vars:
+    prov_remote_base: /var/lib/provisioner
+    scan_remote_scripts: "{{ prov_remote_base }}/scripts/scan"
+    scan_remote_reports: "{{ prov_remote_base }}/scan"
+    scan_scripts_src: "{{ playbook_dir }}/../../scripts/scan"
+
+    scan_id_eff: "{{ scan_id | default('') | string }}"
+    scan_id_safe: "{{ scan_id | default('unknown') | string | regex_replace('[^A-Za-z0-9._-]', '_') }}"
+    scan_type_eff: "{{ scan_type | default('full', true) | string | lower }}"
+    scan_refresh_eff: "{{ scan_refresh_cache | default(true) | bool }}"
+    scan_timeout_eff: "{{ scan_timeout | default(1800) | int }}"
+    scan_local_dir: "{{ (scan_output_dir | default('') | string | realpath) if (scan_output_dir | default('') | string | length > 0) else '' }}"
+    scan_local_report: "{{ scan_local_dir }}/{{ inventory_hostname }}.json"
+    scan_remote_report: "{{ scan_remote_reports }}/{{ scan_id_safe }}.json"
+
+    scan_family_debian: ['Ubuntu', 'Debian']
+    scan_family_centos: ['CentOS', 'Rocky', 'AlmaLinux', 'OracleLinux', 'Oracle']
+    scan_family_rhel: ['RedHat']
+
+    # state shared between block / rescue / always
+    scan_report_ok: false
+    scan_failed: false
+    scan_failure_reason: ""
+    scan_script: ""
+
+  tasks:
+    - name: Scan host
+      block:
+        - name: Validate scan parameters
+          ansible.builtin.assert:
+            that:
+              - scan_id is defined
+              - scan_id_eff | length > 0
+              - scan_output_dir is defined
+              - scan_local_dir | length > 0
+              - scan_type_eff in ['full', 'vulnerability', 'compliance', 'inventory']
+            fail_msg: >-
+              Invalid scan parameters: scan_id and scan_output_dir are required and scan_type
+              must be one of full, vulnerability, compliance, inventory
+              (got scan_id='{{ scan_id | default('') }}', scan_type='{{ scan_type | default('full') }}',
+              scan_output_dir='{{ scan_output_dir | default('') }}').
+            quiet: true
+
+        - name: Ensure the controller output directory exists
+          ansible.builtin.file:
+            path: "{{ scan_local_dir }}"
+            state: directory
+            mode: "0755"
+          delegate_to: localhost
+          become: false
+
+        - name: Gather minimal facts
+          ansible.builtin.setup:
+            gather_subset:
+              - "!all"
+              - min
+          register: scan_setup
+          ignore_unreachable: true
+
+        - name: Fail when the host is unreachable
+          ansible.builtin.fail:
+            msg: >-
+              Host {{ inventory_hostname }} ({{ ansible_host | default('no ansible_host') }}) is unreachable:
+              {{ scan_setup.msg | default('connection failed') }}
+          when: scan_setup.unreachable | default(false)
+
+        - name: Select the scan script for the detected distribution
+          ansible.builtin.set_fact:
+            scan_script: >-
+              {{ 'scan_ubuntu.sh' if ansible_facts.distribution | default('') in scan_family_debian
+                 else 'scan_centos.sh' if ansible_facts.distribution | default('') in scan_family_centos
+                 else 'scan_rhel.sh' if ansible_facts.distribution | default('') in scan_family_rhel
+                 else '' }}
+
+        - name: Fail on unsupported distributions
+          ansible.builtin.fail:
+            msg: >-
+              Unsupported distribution '{{ ansible_facts.distribution | default('unknown') }}
+              {{ ansible_facts.distribution_version | default('') }}' on {{ inventory_hostname }}
+              (declared_os={{ declared_os | default('n/a') }}). Supported: Ubuntu, Debian, CentOS,
+              Rocky, AlmaLinux, Oracle Linux, RedHat.
+          when: scan_script | length == 0
+
+        - name: Note a mismatch between declared and detected operating system
+          ansible.builtin.debug:
+            msg: >-
+              declared_os='{{ declared_os }}' but detected
+              '{{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }}';
+              using {{ scan_script }} based on the detected distribution.
+          when:
+            - declared_os is defined
+            - declared_os | string | length > 0
+            - (ansible_facts.distribution | lower) not in (declared_os | string | lower)
+            - (declared_os | string | lower) not in (ansible_facts.distribution | lower)
+            - not ((declared_os | string | lower) is search('rhel|red') and ansible_facts.distribution == 'RedHat')
+
+        - name: Create remote working directories
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0750"
+          loop:
+            - "{{ prov_remote_base }}"
+            - "{{ prov_remote_base }}/scripts"
+            - "{{ scan_remote_scripts }}"
+            - "{{ scan_remote_reports }}"
+
+        - name: Copy scan scripts to the target
+          ansible.builtin.copy:
+            src: "{{ scan_scripts_src }}/{{ item }}"
+            dest: "{{ scan_remote_scripts }}/{{ item }}"
+            owner: root
+            group: root
+            mode: "0750"
+          loop:
+            - scan_common.sh
+            - "{{ scan_script }}"
+
+        - name: Remove a stale report from a previous run with the same scan id
+          ansible.builtin.file:
+            path: "{{ scan_remote_report }}"
+            state: absent
+
+        - name: Run the scan script
+          ansible.builtin.command:
+            argv: >-
+              {{ ['/usr/bin/env', 'bash', scan_remote_scripts ~ '/' ~ scan_script,
+                  '--scan-id', scan_id_eff,
+                  '--type', scan_type_eff,
+                  '--output', scan_remote_report]
+                 + ([] if scan_refresh_eff else ['--no-refresh']) }}
+          environment:
+            LC_ALL: C
+            LANG: C
+          async: "{{ scan_timeout_eff }}"
+          poll: 10
+          register: scan_run
+          changed_when: false
+          failed_when: scan_run.rc | default(1) != 0
+
+        - name: Check that the report was written
+          ansible.builtin.stat:
+            path: "{{ scan_remote_report }}"
+          register: scan_report_stat
+
+        - name: Fail when the report is missing or empty
+          ansible.builtin.fail:
+            msg: "Scan script finished but {{ scan_remote_report }} is missing or empty on {{ inventory_hostname }}."
+          when: not scan_report_stat.stat.exists or (scan_report_stat.stat.size | default(0) | int) == 0
+
+        - name: Fetch the report to the controller
+          ansible.builtin.fetch:
+            src: "{{ scan_remote_report }}"
+            dest: "{{ scan_local_report }}"
+            flat: true
+            fail_on_missing: true
+
+        - name: Validate the fetched report
+          ansible.builtin.assert:
+            that:
+              - scan_report_parsed is mapping
+              - scan_report_parsed.schema_version | int == 1
+              - (scan_report_parsed.scan_id | string) == scan_id_eff
+              - scan_report_parsed.os is mapping
+              - scan_report_parsed.packages is mapping
+              - scan_report_parsed.pending_updates is sequence
+              - scan_report_parsed.compliance is sequence
+              - scan_report_parsed.errors is sequence
+            fail_msg: "Fetched report {{ scan_local_report }} is not a valid schema_version 1 scan report."
+            quiet: true
+          vars:
+            scan_report_parsed: "{{ lookup('ansible.builtin.file', scan_local_report) | from_json }}"
+
+        - name: Mark the report as valid
+          ansible.builtin.set_fact:
+            scan_report_ok: true
+
+        - name: Show scan summary
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }}: {{ scan_summary.os.pretty_name | default('?') }},
+              {{ scan_summary.packages.updates_available | default(0) }} update(s)
+              ({{ scan_summary.packages.security_updates | default(0) }} security),
+              reboot_required={{ scan_summary.reboot_required | default(false) }},
+              compliance fail/warn=
+              {{- scan_summary.compliance | selectattr('status', 'equalto', 'fail') | list | length }}/
+              {{- scan_summary.compliance | selectattr('status', 'equalto', 'warn') | list | length }},
+              notes={{ scan_summary.errors | length }}
+          vars:
+            scan_summary: "{{ lookup('ansible.builtin.file', scan_local_report) | from_json }}"
+
+      rescue:
+        - name: Record the failure
+          ansible.builtin.set_fact:
+            scan_failed: true
+            scan_failure_reason: >-
+              {{ (ansible_failed_task.name | default('unknown task')) ~ ': ' ~
+                 (ansible_failed_result.msg | default(ansible_failed_result.stderr | default('task failed'), true) | string) }}
+
+        - name: Show the tail of the scan script output
+          ansible.builtin.debug:
+            msg: "{{ (scan_run.stderr_lines | default([]))[-15:] }}"
+          when: scan_run is defined and scan_run.stderr_lines is defined
+
+      always:
+        - name: Ensure the controller output directory exists for the fallback report
+          ansible.builtin.file:
+            path: "{{ scan_local_dir }}"
+            state: directory
+            mode: "0755"
+          delegate_to: localhost
+          become: false
+          when:
+            - scan_failed | bool
+            - not (scan_report_ok | bool)
+            - scan_local_dir | length > 0
+
+        - name: Write a fallback report on the controller
+          ansible.builtin.copy:
+            dest: "{{ scan_local_report }}"
+            mode: "0644"
+            content: |
+              {
+                "schema_version": 1,
+                "scan_id": {{ scan_id_eff | to_json }},
+                "scan_type": {{ scan_type_eff | to_json }},
+                "hostname": {{ (ansible_facts.fqdn | default(ansible_facts.hostname | default(inventory_hostname), true)) | string | to_json }},
+                "timestamp": {{ now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ') | to_json }},
+                "os": {
+                  "id": {{ (ansible_facts.distribution | default('unknown')) | string | lower | to_json }},
+                  "version": {{ (ansible_facts.distribution_version | default('')) | string | to_json }},
+                  "pretty_name": {{ ((ansible_facts.distribution | default('')) ~ ' ' ~ (ansible_facts.distribution_version | default(''))) | trim | to_json }},
+                  "kernel": {{ (ansible_facts.kernel | default('')) | string | to_json }},
+                  "arch": {{ (ansible_facts.architecture | default('')) | string | to_json }}
+                },
+                "packages": {"installed_count": 0, "updates_available": 0, "security_updates": 0},
+                "pending_updates": [],
+                "reboot_required": false,
+                "compliance": [],
+                "system": {
+                  "uptime_seconds": 0,
+                  "disk": [],
+                  "memory_mb": {"total": 0, "available": 0},
+                  "failed_services": [],
+                  "listening_ports": []
+                },
+                "errors": {{ ['scan failed, no data collected: ' ~ (scan_failure_reason | default('unknown error', true) | string | truncate(900, true, '...'))] | to_json }}
+              }
+          delegate_to: localhost
+          become: false
+          when:
+            - scan_failed | bool
+            - not (scan_report_ok | bool)
+            - scan_local_dir | length > 0
+
+        - name: Mark the host as failed when the scan did not complete
+          ansible.builtin.fail:
+            msg: "Scan of {{ inventory_hostname }} failed: {{ scan_failure_reason }}"
+          when: scan_failed | bool

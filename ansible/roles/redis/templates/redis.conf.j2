@@ -1,0 +1,122 @@
+# {{ ansible_managed }}
+#
+# Redis data node  : {{ inventory_hostname }} ({{ __redis_self_addr }})
+# Deployment mode  : {{ redis_mode }}
+# Requested version: {{ redis_version }} ({{ redis_install_method }})
+#
+# NOTE: redis itself may rewrite this file (CONFIG REWRITE, sentinel failover).
+{# Booleans coming from extra vars -> redis yes/no #}
+{% macro yn(v) -%}
+{{ 'yes' if (v | string | lower) in ['true', 'yes', 'on', '1'] else 'no' }}
+{%- endmacro %}
+
+################################## NETWORK #####################################
+bind {{ __redis_bind_effective }}
+port {{ redis_port }}
+protected-mode {{ yn(redis_protected_mode) }}
+tcp-backlog {{ redis_tcp_backlog }}
+timeout {{ redis_timeout }}
+tcp-keepalive {{ redis_tcp_keepalive }}
+
+################################## GENERAL #####################################
+# systemd runs redis in the foreground (Type=simple), no daemonizing/pidfile.
+daemonize no
+supervised no
+loglevel {{ redis_loglevel }}
+logfile "{{ __redis_log_file }}"
+databases {{ redis_databases }}
+dir {{ redis_data_dir }}
+
+################################ PERSISTENCE ###################################
+# redis_persistence = {{ redis_persistence }}
+{% if redis_persistence in ['rdb', 'both'] %}
+{% for point in redis_rdb_save_points %}
+save {{ point }}
+{% endfor %}
+{% else %}
+# RDB snapshots disabled
+save ""
+{% endif %}
+stop-writes-on-bgsave-error yes
+rdbcompression yes
+rdbchecksum yes
+dbfilename dump-{{ redis_port }}.rdb
+
+{% if redis_persistence in ['aof', 'both'] %}
+appendonly yes
+appendfsync {{ redis_appendfsync }}
+no-appendfsync-on-rewrite no
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+aof-use-rdb-preamble yes
+{% else %}
+appendonly no
+{% endif %}
+appendfilename "appendonly-{{ redis_port }}.aof"
+
+################################# SECURITY #####################################
+{% if redis_password | string | length > 0 %}
+requirepass "{{ redis_password }}"
+# Same password towards the master: any node can become master or replica
+# after a failover, so both directives are set everywhere.
+masterauth "{{ redis_password }}"
+{% else %}
+# no password configured (redis_password is empty)
+{% endif %}
+
+################################ REPLICATION ###################################
+{% if redis_mode in ['replication', 'sentinel'] %}
+{% if __redis_sentinel_managed | default(false) | bool %}
+{#  Re-render in sentinel mode: keep whatever role the node has right now.  #}
+{% if __redis_preserved_replicaof | default('') | length > 0 %}
+{{ __redis_preserved_replicaof }}
+{% else %}
+# currently the master (no replicaof line was present before re-rendering)
+{% endif %}
+{% elif __redis_is_replica | bool %}
+replicaof {{ __redis_master_addr }} {{ redis_port }}
+{% else %}
+# this node is the initial master
+{% endif %}
+{% endif %}
+replica-serve-stale-data yes
+replica-read-only {{ yn(redis_replica_read_only) }}
+repl-diskless-sync no
+repl-backlog-size {{ redis_repl_backlog_size }}
+{% if redis_min_replicas_to_write | int > 0 %}
+min-replicas-to-write {{ redis_min_replicas_to_write }}
+min-replicas-max-lag {{ redis_min_replicas_max_lag }}
+{% endif %}
+
+############################## MEMORY MANAGEMENT ###############################
+{% if redis_maxmemory | string | length > 0 %}
+maxmemory {{ redis_maxmemory }}
+{% else %}
+# maxmemory not set: no limit
+{% endif %}
+maxmemory-policy {{ redis_maxmemory_policy }}
+
+{% if redis_mode == 'cluster' %}
+################################ REDIS CLUSTER #################################
+cluster-enabled yes
+# nodes-*.conf is written by redis itself (cluster state), relative to `dir`.
+cluster-config-file nodes-{{ redis_port }}.conf
+cluster-node-timeout {{ redis_cluster_node_timeout }}
+cluster-require-full-coverage {{ yn(redis_cluster_require_full_coverage) }}
+{% if __redis_bind_ip != '0.0.0.0' %}
+cluster-announce-ip {{ __redis_bind_ip }}
+{% endif %}
+cluster-announce-port {{ redis_port }}
+cluster-announce-bus-port {{ (redis_port | int) + 10000 }}
+
+{% endif %}
+################################## SLOW LOG ####################################
+slowlog-log-slower-than 10000
+slowlog-max-len 128
+
+{% if redis_extra_config | length > 0 %}
+############################ EXTRA (redis_extra_config) ########################
+{% for key, value in redis_extra_config | dictsort %}
+{{ key }} {{ 'yes' if value is sameas true else ('no' if value is sameas false else value) }}
+{% endfor %}
+{% endif %}

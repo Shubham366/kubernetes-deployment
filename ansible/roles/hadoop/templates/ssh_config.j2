@@ -1,0 +1,22 @@
+# {{ ansible_managed }}
+# SSH client settings of the {{ hadoop_user }} service account.
+# Scoped to the members of cluster {{ hadoop_cluster_name }} only.
+{% set names = [] %}
+{% for h in hadoop_all_hosts %}
+{%   set _ = names.append(hadoop_node_map[h].name) %}
+{%   if hadoop_node_map[h].ip and hadoop_node_map[h].ip != hadoop_node_map[h].name %}
+{%     set _ = names.append(hadoop_node_map[h].ip) %}
+{%   endif %}
+{% endfor %}
+{# One Host block per node keeps the lines short even for large clusters. #}
+{% for n in names | unique %}
+Host {{ n }}
+    User {{ hadoop_user }}
+    IdentityFile {{ hadoop_ssh_key_file }}
+    BatchMode yes
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
+    ConnectTimeout 10
+
+{% endfor %}

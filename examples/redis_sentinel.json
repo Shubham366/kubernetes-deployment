@@ -1,0 +1,10 @@
+{
+  "version": "7.2.5",
+  "mode": "sentinel",
+  "roles": {
+    "redis_master": ["an-db-01"],
+    "redis_replica": ["an-db-02", "an-db-03"],
+    "redis_sentinel": ["an-db-01", "an-db-02", "an-db-03"]
+  },
+  "vars": {"redis_maxmemory": "2gb", "redis_maxmemory_policy": "allkeys-lru", "redis_persistence": "aof"}
+}

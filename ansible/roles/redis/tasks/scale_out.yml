@@ -1,0 +1,74 @@
+---
+# Redis Cluster scale-out. Runs on the seed node (first redis_cluster host
+# that is not in redis_new_nodes) after the new nodes were installed as empty
+# cluster-enabled instances by the data-node play.
+#
+#   1. every new node is joined with `redis-cli --cluster add-node`
+#      (as an empty master, or as a replica with redis_scale_out_as_replica)
+#   2. slots are rebalanced onto the new empty masters
+#
+# Both steps are idempotent: nodes that already joined are skipped and a
+# balanced cluster is left alone by `--cluster rebalance`.
+
+- name: Scale out | load variables
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Scale out | resolve node addresses
+  ansible.builtin.include_tasks: resolve_nodes.yml
+
+- name: Scale out | new cluster nodes
+  ansible.builtin.set_fact:
+    __redis_scale_nodes: "{{ __redis_new_nodes | intersect(__redis_cluster_group) }}"
+    __redis_seed_endpoint: "{{ __redis_node_ips[inventory_hostname] }}:{{ redis_port }}"
+
+- name: Scale out | the existing cluster must be healthy first
+  ansible.builtin.command: "{{ __redis_cli }} cluster info"
+  environment: "{{ __redis_cli_env }}"
+  register: __redis_scale_pre
+  changed_when: false
+  failed_when: "'cluster_state:ok' not in __redis_scale_pre.stdout"
+
+- name: Scale out | join new nodes one at a time
+  ansible.builtin.include_tasks: scale_out_node.yml
+  loop: "{{ __redis_scale_nodes }}"
+  loop_control:
+    loop_var: __redis_new_node
+
+# Gives the new masters their share of the 16384 slots (and the keys in
+# them). Retried because right after add-node the nodes may briefly disagree
+# about the configuration, which makes rebalance refuse to start.
+- name: Scale out | rebalance slots onto the new masters
+  ansible.builtin.command: >-
+    {{ __redis_cli_bin }} --cluster rebalance {{ __redis_seed_endpoint }}
+    --cluster-use-empty-masters
+  environment: "{{ __redis_cli_env }}"
+  register: __redis_rebalance
+  changed_when: "'Moving' in __redis_rebalance.stdout"
+  retries: 6
+  delay: 10
+  until: __redis_rebalance.rc == 0
+  when:
+    - redis_scale_out_rebalance | bool
+    - not (redis_scale_out_as_replica | bool)
+
+- name: Scale out | wait for cluster_state:ok
+  ansible.builtin.command: "{{ __redis_cli }} cluster info"
+  environment: "{{ __redis_cli_env }}"
+  register: __redis_scale_post
+  changed_when: false
+  retries: "{{ redis_wait_retries | int }}"
+  delay: "{{ redis_wait_delay | int }}"
+  until:
+    - "'cluster_state:ok' in __redis_scale_post.stdout"
+    - "'cluster_slots_assigned:16384' in __redis_scale_post.stdout"
+
+- name: Scale out | consistency check
+  ansible.builtin.command: "{{ __redis_cli_bin }} --cluster check {{ __redis_seed_endpoint }}"
+  environment: "{{ __redis_cli_env }}"
+  register: __redis_scale_check
+  changed_when: false
+  failed_when: false
+
+- name: Scale out | topology
+  ansible.builtin.debug:
+    msg: "{{ __redis_scale_check.stdout_lines }}"

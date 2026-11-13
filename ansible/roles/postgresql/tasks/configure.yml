@@ -1,0 +1,71 @@
+---
+# postgresql.conf + pg_hba.conf, then make sure the server is running with
+# them. Used for the primary and for replicas (after their base backup, as on
+# the RedHat family the config files live inside the data directory).
+
+- name: Configure | conf.d include directory (Debian)
+  ansible.builtin.file:
+    path: "{{ __pg_conf_dir }}/conf.d"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0755"
+  when: ansible_os_family == 'Debian'
+
+# A base backup taken from a Debian primary carries no pg_ident.conf (it
+# lives in /etc there); make sure the file referenced by default exists.
+- name: Configure | pg_ident.conf exists
+  ansible.builtin.copy:
+    dest: "{{ __pg_conf_dir }}/pg_ident.conf"
+    content: "# Managed by Ansible (postgresql role)\n"
+    force: false
+    owner: postgres
+    group: postgres
+    mode: "0640"
+
+- name: Configure | postgresql.conf
+  ansible.builtin.template:
+    src: postgresql.conf.j2
+    dest: "{{ __pg_conf_file }}"
+    owner: postgres
+    group: postgres
+    mode: "0644"
+  notify: Restart postgresql
+
+- name: Configure | pg_hba.conf
+  ansible.builtin.template:
+    src: pg_hba.conf.j2
+    dest: "{{ __pg_hba_file }}"
+    owner: postgres
+    group: postgres
+    mode: "0640"
+  notify: Reload postgresql
+
+# Debian: enabling the umbrella postgresql.service starts every cluster whose
+# start.conf says "auto" at boot. RedHat: enable the versioned unit itself.
+- name: Configure | enable at boot
+  ansible.builtin.systemd:
+    name: "{{ __pg_os_enable_service }}"
+    enabled: true
+    daemon_reload: true
+
+# Apply the changes now. "restarted" also starts a server that is not running
+# yet (fresh cluster / freshly restored replica), so this is also the first
+# start. See handlers/main.yml for the ordering restart -> reload.
+- name: Configure | apply pending restart / reload
+  ansible.builtin.meta: flush_handlers
+
+- name: Configure | make sure the server is running
+  ansible.builtin.systemd:
+    name: "{{ __pg_service }}"
+    state: started
+
+# pg_isready returns 1 while the server is starting up / replaying WAL
+# without hot standby, 0 once it accepts connections.
+- name: Configure | wait until the server accepts connections
+  ansible.builtin.command: "{{ __pg_bin_dir }}/pg_isready -h {{ __pg_socket_dir }} -p {{ postgresql_port }}"
+  register: __pg_isready
+  changed_when: false
+  retries: 60
+  delay: 2
+  until: __pg_isready.rc == 0

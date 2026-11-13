@@ -1,0 +1,219 @@
+---
+# =============================================================================
+# Redis provisioning playbook
+#
+#   ansible-playbook -i <inventory> playbooks/software/redis.yml \
+#       -e redis_action=install -e redis_mode=cluster -e redis_version=7.2.5
+#
+# Inventory groups (any of them may be missing):
+#   redis_master    one master (standalone / replication / sentinel)
+#   redis_replica   replicas of the master
+#   redis_sentinel  sentinels (may be the same hosts as the data nodes)
+#   redis_cluster   every node of a Redis Cluster deployment
+#
+# redis_action: install | start | stop | restart | status | uninstall | scale_out
+#
+# The play order matters: data nodes first, then sentinels, then the one-off
+# cluster bootstrap. Each play only does something for the actions it belongs
+# to (the `when:` on its include_role), everything else is skipped.
+#
+# Facts: every play has gather_facts: false; the role gathers them itself
+# (tasks/setup_vars.yml) the first time it really runs on a host, so plays
+# that are skipped for the current action never even connect to the hosts.
+#
+# NOTE: role defaults are not visible to the `when:` of an include_role task,
+# so the few values the playbook itself branches on are normalised below into
+# `_redis_*` play vars (shared between the plays through a YAML anchor).
+# =============================================================================
+
+- name: Redis | Preflight checks
+  hosts: "redis_master:redis_replica:redis_sentinel:redis_cluster:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  vars: &redis_play_vars
+    _redis_action: "{{ redis_action | default('install') }}"
+    _redis_mode: >-
+      {{ redis_mode | default(
+           'cluster' if (groups.get('redis_cluster', []) | length > 0)
+           else 'sentinel' if (groups.get('redis_sentinel', []) | length > 0)
+           else 'replication' if (groups.get('redis_replica', []) | length > 0)
+           else 'standalone') }}
+    _redis_new_nodes: >-
+      {{ (redis_new_nodes.split(',') | map('trim') | select | list)
+         if (redis_new_nodes | default([])) is string else (redis_new_nodes | default([], true)) }}
+    # First cluster node that is NOT being added in this run: the node all
+    # `redis-cli --cluster` commands are issued from.
+    _redis_cluster_seed: >-
+      {{ groups.get('redis_cluster', []) | difference(_redis_new_nodes) | first | default('') }}
+  tasks:
+    - name: Run redis preflight assertions
+      ansible.builtin.include_role:
+        name: redis
+        tasks_from: preflight
+
+# -----------------------------------------------------------------------------
+# install / scale_out
+# -----------------------------------------------------------------------------
+
+- name: Redis | Install and configure data nodes
+  hosts: "redis_master:redis_replica:redis_cluster:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  vars: *redis_play_vars
+  tasks:
+    - name: Install and configure redis data node
+      ansible.builtin.include_role:
+        name: redis
+        tasks_from: data_node
+      # scale_out only touches the new nodes; existing nodes keep running
+      when: >-
+        _redis_action == 'install'
+        or (_redis_action == 'scale_out' and inventory_hostname in _redis_new_nodes)
+
+- name: Redis | Install and configure sentinels
+  hosts: "redis_sentinel:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  vars: *redis_play_vars
+  tasks:
+    - name: Install and configure redis sentinel
+      ansible.builtin.include_role:
+        name: redis
+        tasks_from: sentinel
+      when:
+        - _redis_mode == 'sentinel'
+        - >-
+          _redis_action == 'install'
+          or (_redis_action == 'scale_out' and inventory_hostname in _redis_new_nodes)
+
+- name: Redis | Create the cluster (once)
+  hosts: "redis_cluster:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  vars: *redis_play_vars
+  tasks:
+    - name: Create redis cluster from the seed node
+      ansible.builtin.include_role:
+        name: redis
+        tasks_from: cluster_create
+      when:
+        - _redis_action == 'install'
+        - _redis_mode == 'cluster'
+        - inventory_hostname == _redis_cluster_seed
+
+- name: Redis | Scale out the cluster (add-node + rebalance)
+  hosts: "redis_cluster:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  vars: *redis_play_vars
+  tasks:
+    - name: Join new nodes to the cluster from the seed node
+      ansible.builtin.include_role:
+        name: redis
+        tasks_from: scale_out
+      when:
+        - _redis_action == 'scale_out'
+        - _redis_mode == 'cluster'
+        - inventory_hostname == _redis_cluster_seed
+
+- name: Redis | Verify newly added replicas
+  hosts: "redis_replica:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  vars: *redis_play_vars
+  tasks:
+    - name: Wait for the new replica to sync with its master
+      ansible.builtin.include_role:
+        name: redis
+        tasks_from: verify_replica
+      when:
+        - _redis_action == 'scale_out'
+        - _redis_mode in ['replication', 'sentinel']
+        - inventory_hostname in _redis_new_nodes
+
+# -----------------------------------------------------------------------------
+# start / stop
+# -----------------------------------------------------------------------------
+
+- name: Redis | Start or stop services
+  hosts: "redis_master:redis_replica:redis_sentinel:redis_cluster:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  vars: *redis_play_vars
+  tasks:
+    - name: Start / stop redis services
+      ansible.builtin.include_role:
+        name: redis
+        tasks_from: service_action
+      when: _redis_action in ['start', 'stop']
+
+# -----------------------------------------------------------------------------
+# restart: rolling, one node at a time, replicas before masters.
+# The *runtime* role (INFO replication) decides which pass a node belongs to,
+# because after a sentinel/cluster failover it can differ from the inventory.
+# -----------------------------------------------------------------------------
+
+- name: Redis | Rolling restart - pass 1 (replicas)
+  hosts: "redis_master:redis_replica:redis_cluster:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  serial: 1
+  vars: *redis_play_vars
+  tasks:
+    - name: Restart node if it is currently a replica
+      ansible.builtin.include_role:
+        name: redis
+        tasks_from: restart
+      vars:
+        redis_restart_pass: replicas
+      when: _redis_action == 'restart'
+
+- name: Redis | Rolling restart - pass 2 (masters)
+  hosts: "redis_master:redis_replica:redis_cluster:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  serial: 1
+  vars: *redis_play_vars
+  tasks:
+    - name: Restart node if it was not restarted in pass 1
+      ansible.builtin.include_role:
+        name: redis
+        tasks_from: restart
+      vars:
+        redis_restart_pass: masters
+      when: _redis_action == 'restart'
+
+- name: Redis | Rolling restart - sentinels
+  hosts: "redis_sentinel:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  serial: 1
+  vars: *redis_play_vars
+  tasks:
+    - name: Restart sentinel
+      ansible.builtin.include_role:
+        name: redis
+        tasks_from: restart_sentinel
+      when:
+        - _redis_action == 'restart'
+        - _redis_mode == 'sentinel'
+
+# -----------------------------------------------------------------------------
+# status
+# -----------------------------------------------------------------------------
+
+- name: Redis | Status
+  hosts: "redis_master:redis_replica:redis_sentinel:redis_cluster:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  vars: *redis_play_vars
+  tasks:
+    - name: Collect and print redis status
+      ansible.builtin.include_role:
+        name: redis
+        tasks_from: status
+      when: _redis_action == 'status'
+
+# -----------------------------------------------------------------------------
+# uninstall
+# -----------------------------------------------------------------------------
+
+- name: Redis | Uninstall
+  hosts: "redis_master:redis_replica:redis_sentinel:redis_cluster:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  vars: *redis_play_vars
+  tasks:
+    - name: Remove redis
+      ansible.builtin.include_role:
+        name: redis
+        tasks_from: uninstall
+      when: _redis_action == 'uninstall'

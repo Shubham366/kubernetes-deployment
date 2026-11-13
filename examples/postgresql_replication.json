@@ -1,0 +1,16 @@
+{
+  "version": "15",
+  "mode": "replication",
+  "roles": {
+    "postgresql_primary": ["an-db-01"],
+    "postgresql_replica": ["an-db-02", "an-db-03"]
+  },
+  "vars": {
+    "postgresql_max_connections": 300,
+    "postgresql_synchronous_replication": false,
+    "postgresql_allowed_cidrs": ["10.20.0.0/24"],
+    "postgresql_databases": [{"name": "appdb", "owner": "app", "encoding": "UTF8"}],
+    "postgresql_users": [{"name": "app", "password": "change-me", "superuser": false, "createdb": false}],
+    "postgresql_extensions": [{"name": "pg_stat_statements", "database": "appdb"}]
+  }
+}

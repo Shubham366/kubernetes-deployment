@@ -1,0 +1,156 @@
+---
+# Turns this host's data directory into a streaming standby of the primary
+# with `pg_basebackup -R`, but ONLY when it is safe to do so.
+#
+# State of the data directory        -> action
+# -----------------------------------------------------------------------
+# standby.signal present             -> already a standby: keep (unless postgresql_force_resync)
+# no PG_VERSION                      -> empty: base backup
+# placeholder marker present         -> throw-away cluster made by replica.yml: base backup
+# "in progress" marker present       -> an earlier base backup was interrupted: redo it
+# initialised, none of the above     -> looks like a real primary/standalone server
+#                                       (e.g. a promoted node with a stale inventory):
+#                                       REFUSE unless postgresql_force_resync=true
+
+- name: Basebackup | inspect the data directory
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ __pg_data_dir }}/standby.signal"
+    - "{{ __pg_data_dir }}/PG_VERSION"
+    - "{{ __pg_seed_marker }}"
+    - "{{ __pg_basebackup_marker }}"
+  register: __pg_bb_stat
+
+- name: Basebackup | classify
+  ansible.builtin.set_fact:
+    __pg_bb_is_standby: "{{ __pg_bb_stat.results[0].stat.exists }}"
+    __pg_bb_initialised: "{{ __pg_bb_stat.results[1].stat.exists }}"
+    __pg_bb_placeholder: "{{ __pg_bb_stat.results[2].stat.exists }}"
+    __pg_bb_interrupted: "{{ __pg_bb_stat.results[3].stat.exists }}"
+
+- name: Basebackup | decide
+  ansible.builtin.set_fact:
+    __pg_bb_needed: >-
+      {{ (postgresql_force_resync | bool) or (__pg_bb_interrupted | bool)
+         or not (__pg_bb_is_standby | bool) }}
+    __pg_bb_unsafe: >-
+      {{ (__pg_bb_initialised | bool) and not (__pg_bb_is_standby | bool)
+         and not (__pg_bb_placeholder | bool) and not (__pg_bb_interrupted | bool)
+         and not (postgresql_force_resync | bool) }}
+
+- name: Basebackup | refuse to overwrite a non-standby cluster
+  ansible.builtin.fail:
+    msg: >-
+      {{ __pg_data_dir }} on {{ inventory_hostname }} contains an initialised PostgreSQL cluster
+      that is NOT a standby (no standby.signal). Building a replica here would destroy it.
+      If this host really should become a replica of {{ __pg_primary_host }}, re-run with
+      postgresql_force_resync=true. If it was promoted earlier, fix the inventory instead.
+  when: __pg_bb_unsafe | bool
+
+- name: Basebackup | nothing to do, already a standby
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} is already a standby ({{ __pg_data_dir }}/standby.signal exists); keeping its data."
+  when: not (__pg_bb_needed | bool)
+
+# ~postgres/.pgpass lets the standby's walreceiver (and pg_rewind, repoint)
+# authenticate without the password being stored anywhere else. ":" and "\"
+# have to be escaped in that file.
+- name: Basebackup | .pgpass for the replication user
+  ansible.builtin.copy:
+    dest: "{{ __pg_pgpass_file }}"
+    owner: postgres
+    group: postgres
+    mode: "0600"
+    content: |
+      # Managed by Ansible (postgresql role)
+      *:{{ postgresql_port }}:replication:{{ postgresql_replication_user }}:{{ __pg_pgpass_password }}
+      *:{{ postgresql_port }}:postgres:{{ postgresql_replication_user }}:{{ __pg_pgpass_password }}
+  diff: false
+  no_log: true
+
+- name: Basebackup | take the base backup
+  when: __pg_bb_needed | bool
+  block:
+    # Fail early, with a readable error, if this host cannot reach the
+    # primary or pg_hba.conf does not let it in.
+    - name: Basebackup | primary reachable on port {{ postgresql_port }}
+      ansible.builtin.wait_for:
+        host: "{{ __pg_primary_addr }}"
+        port: "{{ postgresql_port | int }}"
+        timeout: 30
+
+    - name: Basebackup | stop the local server
+      ansible.builtin.systemd:
+        name: "{{ __pg_service }}"
+        state: stopped
+
+    - name: Basebackup | mark as in progress
+      ansible.builtin.copy:
+        dest: "{{ __pg_basebackup_marker }}"
+        content: "base backup from {{ __pg_primary_addr }} started by Ansible\n"
+        owner: postgres
+        group: postgres
+        mode: "0600"
+
+    # pg_basebackup insists on an empty target. The directory itself is kept
+    # (it may be a mount point); only its contents are removed.
+    - name: Basebackup | empty the data directory
+      ansible.builtin.shell: "find {{ __pg_data_dir | quote }} -mindepth 1 -delete"
+      changed_when: true
+
+    - name: Basebackup | data directory ownership and mode
+      ansible.builtin.file:
+        path: "{{ __pg_data_dir }}"
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: "0700"
+
+    #   -X stream  ship the WAL generated during the backup alongside it
+    #   -c fast    do not wait for the next scheduled checkpoint on the primary
+    #   -S <slot>  stream through this replica's slot (created in primary_prep.yml)
+    #   -R         write standby.signal + primary_conninfo/primary_slot_name
+    #              into postgresql.auto.conf -> the server comes up as a standby
+    #   -w         never prompt; the password comes from PGPASSWORD
+    # Runs asynchronously: a large database can take hours, far longer than an
+    # SSH session should sit idle.
+    - name: Basebackup | pg_basebackup from {{ __pg_primary_addr }} (can take a long time)
+      ansible.builtin.command:
+        cmd: >-
+          {{ __pg_bin_dir }}/pg_basebackup
+          -h {{ __pg_primary_addr }} -p {{ postgresql_port }}
+          -U {{ postgresql_replication_user }}
+          -D {{ __pg_data_dir }}
+          -X stream -c fast -S {{ __pg_slot_name }} -R -w
+      environment:
+        PGPASSWORD: "{{ postgresql_replication_password | string }}"
+        PGAPPNAME: "basebackup_{{ __pg_node_name }}"
+      become: true
+      become_user: postgres
+      async: "{{ postgresql_basebackup_timeout | int }}"
+      poll: 15
+      changed_when: true
+      # no no_log here on purpose: the password is only in the environment
+      # (not part of the task result) and the error output is needed when
+      # the backup fails.
+      register: __pg_basebackup
+
+    - name: Basebackup | standby.signal was written
+      ansible.builtin.stat:
+        path: "{{ __pg_data_dir }}/standby.signal"
+      register: __pg_bb_signal
+      failed_when: not __pg_bb_signal.stat.exists
+
+    # Files created by pg_basebackup inherit the right context only if the
+    # directory was labelled first; make sure (custom data dirs especially).
+    - name: Basebackup | restore SELinux contexts
+      ansible.builtin.command: "restorecon -R {{ __pg_data_dir }}"
+      changed_when: false
+      failed_when: false
+      when: ansible_os_family == 'RedHat'
+
+    - name: Basebackup | done
+      ansible.builtin.file:
+        path: "{{ __pg_basebackup_marker }}"
+        state: absent

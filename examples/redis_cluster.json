@@ -1,0 +1,8 @@
+{
+  "version": "7.2.5",
+  "mode": "cluster",
+  "roles": {
+    "redis_cluster": ["an-worker-01", "an-worker-02", "an-worker-03", "an-db-01", "an-db-02", "an-db-03"]
+  },
+  "vars": {"redis_cluster_replicas": 1, "redis_maxmemory": "1gb"}
+}

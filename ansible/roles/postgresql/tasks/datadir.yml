@@ -1,0 +1,61 @@
+---
+# Data directory plumbing that has to exist before a cluster is created or a
+# base backup is restored. Only does real work for a custom
+# postgresql_data_dir on the RedHat family:
+#
+#   Debian: pg_createcluster -d <dir> records the location in
+#           /etc/postgresql/<ver>/main/postgresql.conf (data_directory), no
+#           unit changes needed.
+#   RedHat: the PGDG unit hardcodes Environment=PGDATA=/var/lib/pgsql/<ver>/data.
+#           postgresql-<ver>-setup and the service both read PGDATA from the
+#           unit, so a custom location needs a systemd drop-in (and an SELinux
+#           file context, see selinux.yml).
+
+- name: Data dir | parent directory
+  ansible.builtin.file:
+    path: "{{ __pg_data_dir | dirname }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0755"
+  when: __pg_custom_data_dir | bool
+
+- name: Data dir | directory (RedHat)
+  ansible.builtin.file:
+    path: "{{ __pg_data_dir }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0700"
+  when: ansible_os_family == 'RedHat'
+
+- name: Data dir | systemd drop-in directory (RedHat, custom data dir)
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ __pg_service }}.service.d"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when:
+    - ansible_os_family == 'RedHat'
+    - __pg_custom_data_dir | bool
+
+- name: Data dir | PGDATA drop-in (RedHat, custom data dir)
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ __pg_service }}.service.d/10-ansible-pgdata.conf"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible (postgresql role)
+      [Service]
+      Environment=PGDATA={{ __pg_data_dir }}
+  register: __pg_dropin
+  when:
+    - ansible_os_family == 'RedHat'
+    - __pg_custom_data_dir | bool
+
+- name: Data dir | reload systemd after drop-in change
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: __pg_dropin is changed

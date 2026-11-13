@@ -1,0 +1,76 @@
+---
+# Full install of the primary (or a standalone server). Safe to re-run.
+
+- name: Primary | load variables
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Primary | summary
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} ({{ __pg_self_addr }}, {{ ansible_distribution }} {{ ansible_distribution_version }}):
+      PostgreSQL {{ __pg_version }} primary, mode={{ postgresql_mode }}, port={{ postgresql_port }},
+      data={{ __pg_data_dir }}, service={{ __pg_service }},
+      replicas={{ __pg_replica_group if postgresql_mode == 'replication' else [] }}
+
+- name: Primary | packages
+  ansible.builtin.include_tasks: install.yml
+
+- name: Primary | data directory plumbing
+  ansible.builtin.include_tasks: datadir.yml
+
+- name: Primary | SELinux
+  ansible.builtin.include_tasks: selinux.yml
+  when:
+    - postgresql_manage_selinux | bool
+    - ansible_os_family == 'RedHat'
+
+- name: Primary | create the database cluster
+  ansible.builtin.include_tasks: initdb.yml
+
+- name: Primary | firewall
+  ansible.builtin.include_tasks: firewall.yml
+  vars:
+    __pg_fw_state: open
+  when: postgresql_manage_firewall | bool
+
+- name: Primary | configuration and service
+  ansible.builtin.include_tasks: configure.yml
+
+# Guard against a stale inventory: after a `promote` the backend must move
+# hosts between the groups. If this "primary" is actually a standby, creating
+# roles/databases would fail in confusing ways (read-only transaction).
+- name: Primary | must not be in recovery
+  ansible.builtin.command: "{{ __pg_psql }}"
+  args:
+    stdin: "SELECT pg_is_in_recovery();"
+  become: true
+  become_user: postgres
+  register: __pg_primary_recovery
+  changed_when: false
+  failed_when: __pg_primary_recovery.rc != 0 or (__pg_primary_recovery.stdout | trim) != 'f'
+
+- name: Primary | roles
+  ansible.builtin.include_tasks: roles.yml
+
+- name: Primary | replication slots for the replicas in the inventory
+  ansible.builtin.command: "{{ __pg_psql }}"
+  args:
+    # returns a row only when the slot had to be created
+    stdin: >-
+      SELECT 'created' FROM pg_create_physical_replication_slot('{{ ('replica_' ~ (item | lower | regex_replace('[^a-z0-9_]', '_')))[:63] }}')
+      WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots
+      WHERE slot_name = '{{ ('replica_' ~ (item | lower | regex_replace('[^a-z0-9_]', '_')))[:63] }}');
+  become: true
+  become_user: postgres
+  loop: "{{ __pg_replica_group }}"
+  register: __pg_slots
+  changed_when: "'created' in __pg_slots.stdout"
+  when: postgresql_mode == 'replication'
+
+- name: Primary | databases
+  ansible.builtin.include_tasks: databases.yml
+  when: postgresql_databases | length > 0
+
+- name: Primary | extensions
+  ansible.builtin.include_tasks: extensions.yml
+  when: postgresql_extensions | length > 0

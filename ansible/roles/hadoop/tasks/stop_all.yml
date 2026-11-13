@@ -1,0 +1,67 @@
+---
+# =============================================================================
+# Stop the whole cluster (hadoop_action = stop | uninstall)
+#
+# One task per daemon type, in reverse dependency order. With the default
+# linear strategy every task finishes on all hosts before the next begins,
+# which gives a cluster-wide ordering inside a single play:
+#
+#   history server -> NodeManagers -> DataNodes -> ResourceManagers ->
+#   SecondaryNameNode -> ZKFC -> NameNodes -> JournalNodes -> ZooKeeper
+#
+# ZKFC goes down before its NameNode so no failover is triggered on the way.
+# =============================================================================
+
+- name: Stop | JobHistory server
+  ansible.builtin.include_tasks: services.yml
+  vars:
+    hadoop_svc_daemons: [historyserver]
+    hadoop_svc_state: stopped
+
+- name: Stop | NodeManagers
+  ansible.builtin.include_tasks: services.yml
+  vars:
+    hadoop_svc_daemons: [nodemanager]
+    hadoop_svc_state: stopped
+
+- name: Stop | DataNodes
+  ansible.builtin.include_tasks: services.yml
+  vars:
+    hadoop_svc_daemons: [datanode]
+    hadoop_svc_state: stopped
+
+- name: Stop | ResourceManagers
+  ansible.builtin.include_tasks: services.yml
+  vars:
+    hadoop_svc_daemons: [resourcemanager]
+    hadoop_svc_state: stopped
+
+- name: Stop | SecondaryNameNode
+  ansible.builtin.include_tasks: services.yml
+  vars:
+    hadoop_svc_daemons: [secondarynamenode]
+    hadoop_svc_state: stopped
+
+- name: Stop | ZK failover controllers
+  ansible.builtin.include_tasks: services.yml
+  vars:
+    hadoop_svc_daemons: [zkfc]
+    hadoop_svc_state: stopped
+
+- name: Stop | NameNodes
+  ansible.builtin.include_tasks: services.yml
+  vars:
+    hadoop_svc_daemons: [namenode]
+    hadoop_svc_state: stopped
+
+- name: Stop | JournalNodes
+  ansible.builtin.include_tasks: services.yml
+  vars:
+    hadoop_svc_daemons: [journalnode]
+    hadoop_svc_state: stopped
+
+- name: Stop | ZooKeeper
+  ansible.builtin.include_tasks: services.yml
+  vars:
+    hadoop_svc_daemons: [zookeeper]
+    hadoop_svc_state: stopped

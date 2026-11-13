@@ -1,0 +1,56 @@
+---
+# postgresql_action = start | stop | restart on one host.
+# Ordering across hosts (primary vs. replicas) is done by the playbook.
+
+- name: Service | load variables
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Service | {{ postgresql_action }} {{ __pg_service }}
+  ansible.builtin.systemd:
+    name: "{{ __pg_service }}"
+    state: "{{ {'start': 'started', 'stop': 'stopped', 'restart': 'restarted'}[postgresql_action] }}"
+    daemon_reload: true
+
+- name: Service | wait until the server accepts connections
+  ansible.builtin.command: "{{ __pg_bin_dir }}/pg_isready -h {{ __pg_socket_dir }} -p {{ postgresql_port }}"
+  register: __pg_svc_ready
+  changed_when: false
+  retries: 60
+  delay: 2
+  until: __pg_svc_ready.rc == 0
+  when: postgresql_action in ['start', 'restart']
+
+# Before the play moves on to the next replica (serial: 1) / the primary,
+# give a restarted standby the chance to reconnect.
+- name: Service | role after {{ postgresql_action }}
+  ansible.builtin.command: "{{ __pg_psql }}"
+  args:
+    stdin: "SELECT CASE WHEN pg_is_in_recovery() THEN 'standby' ELSE 'primary' END;"
+  become: true
+  become_user: postgres
+  register: __pg_svc_role
+  changed_when: false
+  when: postgresql_action in ['start', 'restart']
+
+- name: Service | wait for the standby to stream again
+  ansible.builtin.command: "{{ __pg_psql }}"
+  args:
+    stdin: "SELECT coalesce((SELECT status FROM pg_stat_wal_receiver LIMIT 1), 'none');"
+  become: true
+  become_user: postgres
+  register: __pg_svc_stream
+  changed_when: false
+  retries: 20
+  delay: 3
+  until: (__pg_svc_stream.stdout | default('') | trim) == 'streaming'
+  # not fatal: the primary may legitimately be down (e.g. during a full stop/start cycle)
+  failed_when: false
+  when:
+    - postgresql_action in ['start', 'restart']
+    - (__pg_svc_role.stdout | default('') | trim) == 'standby'
+
+- name: Service | result
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: {{ __pg_service }} {{ postgresql_action }} done
+      {{ ('(' ~ (__pg_svc_role.stdout | default('') | trim) ~ ')') if postgresql_action != 'stop' else '' }}

@@ -1,0 +1,266 @@
+---
+# =============================================================================
+# rollback.yml - revert a patch run identified by patch_id
+#
+# Extra vars
+#   target_hosts         host pattern (default: all)
+#   patch_id             (required) the patch run to revert; its state must
+#                        exist on the target in /var/lib/provisioner/patch/<patch_id>/
+#   rollback_output_dir  (required) controller-local directory; the report lands
+#                        at <rollback_output_dir>/<inventory_hostname>.json
+#   patch_serial         batch size, e.g. 1, 2 or "25%" (default: 100%)
+#   rollback_timeout     seconds the rollback script may run (default: 7200)
+#
+# What happens on the target (patch_<distro>.sh --rollback)
+#   EL family : yum/dnf "history undo <transaction_id>" using the id saved by
+#               the patch run, followed by explicit downgrades for anything
+#               still newer than packages.before
+#   Ubuntu    : best effort downgrade to the versions in packages.before for
+#               every package still available in the APT sources or the local
+#               .deb cache; everything that cannot be downgraded is listed in
+#               "errors"
+#
+# Report
+#   {"schema_version":1,"patch_id":"..","hostname":"..",
+#    "status":"success|partial|failed",
+#    "packages_reverted":[{"name":"..","from":"..","to":".."}],"errors":[..]}
+#
+# No reboot is performed; when one is needed to finish the rollback the script
+# adds a "NOTE: ..." entry to "errors". A host that cannot be rolled back
+# (unreachable, unsupported, no saved state ...) still gets a report with
+# status "failed" and is then marked failed.
+# =============================================================================
+
+- name: Roll back a patch run
+  hosts: "{{ target_hosts | default('all') }}"
+  serial: "{{ patch_serial | default('100%', true) }}"
+  gather_facts: false
+  become: true
+  any_errors_fatal: false
+
+  vars:
+    prov_remote_base: /var/lib/provisioner
+    patch_remote_scripts: "{{ prov_remote_base }}/scripts/patch"
+    patch_scripts_src: "{{ playbook_dir }}/../../scripts/patch"
+
+    patch_id_eff: "{{ patch_id | default('') | string }}"
+    rollback_timeout_eff: "{{ rollback_timeout | default(7200) | int }}"
+    rollback_local_dir: "{{ (rollback_output_dir | default('') | string | realpath) if (rollback_output_dir | default('') | string | length > 0) else '' }}"
+    rollback_local_report: "{{ rollback_local_dir }}/{{ inventory_hostname }}.json"
+
+    patch_remote_state: "{{ prov_remote_base }}/patch/{{ patch_id_eff }}"
+    rollback_remote_report: "{{ patch_remote_state }}/rollback_result.json"
+
+    patch_family_debian: ['Ubuntu', 'Debian']
+    patch_family_centos: ['CentOS', 'Rocky', 'AlmaLinux', 'OracleLinux', 'Oracle']
+    patch_family_rhel: ['RedHat']
+
+    # state shared between block / rescue / always (overridden with set_fact)
+    patch_script: ""
+    rollback_report_ok: false
+    rollback_failed: false
+    rollback_failure_reason: ""
+    rollback_status: ""
+
+  tasks:
+    - name: Roll back host
+      block:
+        - name: Validate rollback parameters
+          ansible.builtin.assert:
+            that:
+              - patch_id is defined
+              - patch_id_eff is match('^[A-Za-z0-9][A-Za-z0-9._-]*$')
+              - rollback_output_dir is defined
+              - rollback_local_dir | length > 0
+            fail_msg: >-
+              Invalid rollback parameters: patch_id (letters, digits, '.', '_', '-') and
+              rollback_output_dir are required (got patch_id='{{ patch_id | default('') }}',
+              rollback_output_dir='{{ rollback_output_dir | default('') }}').
+            quiet: true
+
+        - name: Ensure the controller output directory exists
+          ansible.builtin.file:
+            path: "{{ rollback_local_dir }}"
+            state: directory
+            mode: "0755"
+          delegate_to: localhost
+          become: false
+
+        - name: Gather minimal facts
+          ansible.builtin.setup:
+            gather_subset:
+              - "!all"
+              - min
+          register: rollback_setup
+          ignore_unreachable: true
+
+        - name: Fail when the host is unreachable
+          ansible.builtin.fail:
+            msg: >-
+              Host {{ inventory_hostname }} ({{ ansible_host | default('no ansible_host') }}) is unreachable:
+              {{ rollback_setup.msg | default('connection failed') }}
+          when: rollback_setup.unreachable | default(false)
+
+        - name: Select the patch script for the detected distribution
+          ansible.builtin.set_fact:
+            patch_script: >-
+              {{ 'patch_ubuntu.sh' if ansible_facts.distribution | default('') in patch_family_debian
+                 else 'patch_centos.sh' if ansible_facts.distribution | default('') in patch_family_centos
+                 else 'patch_rhel.sh' if ansible_facts.distribution | default('') in patch_family_rhel
+                 else '' }}
+
+        - name: Fail on unsupported distributions
+          ansible.builtin.fail:
+            msg: >-
+              Unsupported distribution '{{ ansible_facts.distribution | default('unknown') }}
+              {{ ansible_facts.distribution_version | default('') }}' on {{ inventory_hostname }}
+              (declared_os={{ declared_os | default('n/a') }}). Supported: Ubuntu, Debian, CentOS,
+              Rocky, AlmaLinux, Oracle Linux, RedHat.
+          when: patch_script | length == 0
+
+        - name: Look for the saved state of the patch run
+          ansible.builtin.stat:
+            path: "{{ patch_remote_state }}/packages.before"
+          register: rollback_state_stat
+
+        - name: Fail when no saved patch state exists
+          ansible.builtin.fail:
+            msg: >-
+              No saved state for patch id '{{ patch_id_eff }}' on {{ inventory_hostname }}
+              ({{ patch_remote_state }}/packages.before is missing); the host was not patched with
+              this id (or only as a dry run), so there is nothing to roll back.
+          when: not rollback_state_stat.stat.exists
+
+        - name: Create the remote script directory
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0750"
+          loop:
+            - "{{ prov_remote_base }}/scripts"
+            - "{{ patch_remote_scripts }}"
+
+        - name: Copy patch scripts to the target
+          ansible.builtin.copy:
+            src: "{{ patch_scripts_src }}/{{ item }}"
+            dest: "{{ patch_remote_scripts }}/{{ item }}"
+            owner: root
+            group: root
+            mode: "0750"
+          loop:
+            - patch_common.sh
+            - "{{ patch_script }}"
+
+        - name: Remove the report of an earlier rollback attempt
+          ansible.builtin.file:
+            path: "{{ rollback_remote_report }}"
+            state: absent
+
+        - name: Run the rollback
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/env
+              - bash
+              - "{{ patch_remote_scripts }}/{{ patch_script }}"
+              - --rollback
+              - --patch-id
+              - "{{ patch_id_eff }}"
+              - --output
+              - "{{ rollback_remote_report }}"
+          environment:
+            LC_ALL: C
+            LANG: C
+          async: "{{ rollback_timeout_eff }}"
+          poll: 15
+          register: rollback_run
+          changed_when: true
+          failed_when: rollback_run.rc | default(1) != 0
+
+        - name: Fetch the rollback report to the controller
+          ansible.builtin.fetch:
+            src: "{{ rollback_remote_report }}"
+            dest: "{{ rollback_local_report }}"
+            flat: true
+            fail_on_missing: true
+
+        - name: Validate the fetched report
+          ansible.builtin.assert:
+            that:
+              - rollback_parsed is mapping
+              - rollback_parsed.schema_version | int == 1
+              - rollback_parsed.status in ['success', 'partial', 'failed']
+              - rollback_parsed.packages_reverted is sequence
+              - rollback_parsed.errors is sequence
+            fail_msg: "Fetched report {{ rollback_local_report }} is not a valid schema_version 1 rollback report."
+            quiet: true
+          vars:
+            rollback_parsed: "{{ lookup('ansible.builtin.file', rollback_local_report) | from_json }}"
+
+        - name: Remember the rollback result
+          ansible.builtin.set_fact:
+            rollback_report_ok: true
+            rollback_status: "{{ (lookup('ansible.builtin.file', rollback_local_report) | from_json).status }}"
+
+        - name: Show rollback summary
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }}: rollback status={{ rollback_summary.status }},
+              packages_reverted={{ rollback_summary.packages_reverted | length }},
+              notes={{ rollback_summary.errors | length }}
+          vars:
+            rollback_summary: "{{ lookup('ansible.builtin.file', rollback_local_report) | from_json }}"
+
+      rescue:
+        - name: Record the failure
+          ansible.builtin.set_fact:
+            rollback_failed: true
+            rollback_failure_reason: >-
+              {{ (ansible_failed_task.name | default('unknown task')) ~ ': ' ~
+                 (ansible_failed_result.msg | default(ansible_failed_result.stderr | default('task failed'), true) | string) }}
+
+        - name: Show the tail of the rollback script output
+          ansible.builtin.debug:
+            msg: "{{ (rollback_run.stderr_lines | default([]))[-20:] }}"
+          when: rollback_run is defined and rollback_run.stderr_lines is defined
+
+      always:
+        - name: Ensure the controller output directory exists for the fallback report
+          ansible.builtin.file:
+            path: "{{ rollback_local_dir }}"
+            state: directory
+            mode: "0755"
+          delegate_to: localhost
+          become: false
+          when:
+            - rollback_failed | bool
+            - not (rollback_report_ok | bool)
+            - rollback_local_dir | length > 0
+
+        - name: Write a fallback report on the controller
+          ansible.builtin.copy:
+            dest: "{{ rollback_local_report }}"
+            mode: "0644"
+            content: |
+              {
+                "schema_version": 1,
+                "patch_id": {{ patch_id_eff | to_json }},
+                "hostname": {{ (ansible_facts.fqdn | default(ansible_facts.hostname | default(inventory_hostname), true)) | string | to_json }},
+                "status": "failed",
+                "packages_reverted": [],
+                "errors": {{ ['rollback failed: ' ~ (rollback_failure_reason | default('unknown error', true) | string | truncate(900, true, '...'))] | to_json }}
+              }
+          delegate_to: localhost
+          become: false
+          when:
+            - rollback_failed | bool
+            - not (rollback_report_ok | bool)
+            - rollback_local_dir | length > 0
+
+        - name: Mark the host as failed when the rollback did not complete
+          ansible.builtin.fail:
+            msg: >-
+              Rollback of patch '{{ patch_id_eff }}' on {{ inventory_hostname }} failed:
+              {{ rollback_failure_reason if (rollback_failed | bool) else 'script reported status failed (see report)' }}
+          when: (rollback_failed | bool) or rollback_status == 'failed'

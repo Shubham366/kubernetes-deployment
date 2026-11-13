@@ -1,0 +1,148 @@
+---
+# promote, step 2: turn postgresql_promote_host (a standby) into the primary.
+# Idempotent: a node that is already a primary is left alone.
+#
+# What this does NOT do: change the inventory. Afterwards the backend has to
+# move this host to postgresql_primary (and the old primary out of it),
+# otherwise the next `install` run will complain about the stale topology.
+
+- name: Promote | load variables
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Promote | server must be running
+  ansible.builtin.command: "{{ __pg_bin_dir }}/pg_isready -h {{ __pg_socket_dir }} -p {{ postgresql_port }}"
+  register: __pg_promote_ready
+  changed_when: false
+  failed_when: __pg_promote_ready.rc != 0
+
+- name: Promote | current state
+  ansible.builtin.command: "{{ __pg_psql }}"
+  args:
+    stdin: >-
+      SELECT pg_is_in_recovery()::text
+      || '|' || coalesce(pg_last_wal_receive_lsn()::text, '-')
+      || '|' || coalesce(pg_last_wal_replay_lsn()::text, '-')
+      || '|' || coalesce((SELECT status FROM pg_stat_wal_receiver LIMIT 1), 'disconnected');
+  become: true
+  become_user: postgres
+  register: __pg_promote_state
+  changed_when: false
+
+- name: Promote | parse state
+  ansible.builtin.set_fact:
+    __pg_promote_in_recovery: "{{ (__pg_promote_state.stdout | trim).split('|')[0] == 'true' }}"
+
+- name: Promote | state before promotion
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: in_recovery|receive_lsn|replay_lsn|wal_receiver =
+      {{ __pg_promote_state.stdout | trim }}
+      {{ '' if __pg_promote_in_recovery | bool else '-> already a primary, nothing to promote' }}
+
+- name: Promote | promote the standby
+  when: __pg_promote_in_recovery | bool
+  block:
+    # pg_promote(wait, wait_seconds) (PostgreSQL 12+) returns true once the
+    # promotion has completed. Equivalent to `pg_ctl promote -w`, which is
+    # used as a fallback because it works without a SQL connection quirk
+    # (e.g. on Debian through pg_ctlcluster).
+    - name: Promote | SELECT pg_promote()
+      ansible.builtin.command: "{{ __pg_psql }}"
+      args:
+        stdin: "SELECT pg_promote(true, {{ postgresql_promote_timeout | int }});"
+      become: true
+      become_user: postgres
+      register: __pg_promote_sql
+      changed_when: (__pg_promote_sql.stdout | default('') | trim) == 't'
+      failed_when: false
+
+    - name: Promote | fallback to pg_ctl promote
+      ansible.builtin.command: >-
+        {{ __pg_bin_dir }}/pg_ctl promote -w -t {{ postgresql_promote_timeout | int }} -D {{ __pg_data_dir }}
+      become: true
+      become_user: postgres
+      changed_when: true
+      when: (__pg_promote_sql.stdout | default('') | trim) != 't'
+
+    - name: Promote | wait until the node has left recovery
+      ansible.builtin.command: "{{ __pg_psql }}"
+      args:
+        stdin: "SELECT pg_is_in_recovery();"
+      become: true
+      become_user: postgres
+      register: __pg_promote_check
+      changed_when: false
+      retries: 30
+      delay: 2
+      until: (__pg_promote_check.stdout | default('') | trim) == 'f'
+
+# ---------------------------------------------------------------------------
+# Post-promotion housekeeping on the new primary (also on re-runs)
+# ---------------------------------------------------------------------------
+
+# The base backup copied the old primary's postgresql.auto.conf. If it had
+# synchronous_standby_names set, the new primary would now wait for standbys
+# that are not connected to it and every commit would hang. Start
+# asynchronous; a later install/add_replica run re-enables it via sync.yml.
+- name: Promote | reset synchronous_standby_names
+  ansible.builtin.command: "{{ __pg_psql }}"
+  args:
+    stdin: |
+      ALTER SYSTEM RESET synchronous_standby_names;
+      SELECT pg_reload_conf();
+  become: true
+  become_user: postgres
+  changed_when: false
+
+# Slots are not replicated: recreate one for every other replica so they can
+# be pointed at this node (repoint.yml) without losing WAL.
+- name: Promote | replication slots for the remaining replicas
+  ansible.builtin.command: "{{ __pg_psql }}"
+  args:
+    stdin: >-
+      SELECT 'created' FROM pg_create_physical_replication_slot('{{ ('replica_' ~ (item | lower | regex_replace('[^a-z0-9_]', '_')))[:63] }}')
+      WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots
+      WHERE slot_name = '{{ ('replica_' ~ (item | lower | regex_replace('[^a-z0-9_]', '_')))[:63] }}');
+  become: true
+  become_user: postgres
+  loop: "{{ (__pg_replica_group + __pg_primary_group) | difference([inventory_hostname]) }}"
+  register: __pg_promote_slots
+  changed_when: "'created' in __pg_promote_slots.stdout"
+
+# Makes the new timeline durable right away, so standbys / pg_rewind see it.
+- name: Promote | checkpoint
+  ansible.builtin.command: "{{ __pg_psql }}"
+  args:
+    stdin: "CHECKPOINT;"
+  become: true
+  become_user: postgres
+  changed_when: false
+
+- name: Promote | make sure the new primary starts at boot
+  ansible.builtin.systemd:
+    name: "{{ __pg_os_enable_service }}"
+    enabled: true
+
+- name: Promote | timeline after promotion
+  ansible.builtin.command: "{{ __pg_psql }}"
+  args:
+    stdin: "SELECT timeline_id || '|' || pg_current_wal_lsn() FROM pg_control_checkpoint();"
+  become: true
+  become_user: postgres
+  register: __pg_promote_tl
+  changed_when: false
+
+- name: Promote | result
+  ansible.builtin.debug:
+    msg:
+      postgresql_promote:
+        new_primary: "{{ inventory_hostname }}"
+        address: "{{ __pg_self_addr }}"
+        old_primary: "{{ __pg_primary_host }}"
+        timeline_and_lsn: "{{ __pg_promote_tl.stdout | trim }}"
+        replicas_repointed: "{{ postgresql_promote_repoint_replicas | bool }}"
+        next_steps: >-
+          Update the inventory ({{ inventory_hostname }} -> postgresql_primary).
+          {{ 'Remaining replicas are re-pointed by the next play.' if postgresql_promote_repoint_replicas | bool
+             else 'Remaining replicas still follow the old primary: re-run with postgresql_promote_repoint_replicas=true or rebuild them with add_replica.' }}
+          Rebuild the old primary as a replica with add_replica + postgresql_force_resync=true.

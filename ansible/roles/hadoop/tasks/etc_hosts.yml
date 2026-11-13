@@ -1,0 +1,47 @@
+---
+# =============================================================================
+# /etc/hosts
+#
+# Every node gets "<ip> <name>" for every cluster member whose address is an
+# IP literal in the inventory (see hadoop_node_map in vars/main.yml), so the
+# cluster does not depend on DNS. The block is delimited by markers and fully
+# rewritten on each run, which also makes scale_out / uninstall trivial.
+# =============================================================================
+
+# Debian/Ubuntu installers add "127.0.1.1 <hostname>". A daemon that looks up
+# its own hostname would then bind to / advertise the loopback address.
+- name: Hosts | Remove the 127.0.1.1 loopback alias for the node's own hostname
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: '^127\.0\.1\.1\s+'
+    state: absent
+  when: hadoop_fix_loopback_hostname | bool
+
+# The same problem in another disguise: "127.0.0.1 localhost <cluster-name>".
+- name: Hosts | Check that no cluster name is aliased to localhost
+  ansible.builtin.command:
+    cmd: grep -E '^(127\.0\.0\.1|::1)\s' /etc/hosts
+  register: hadoop_hosts_loopback
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Hosts | Warn about cluster names mapped to loopback
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: /etc/hosts on {{ inventory_hostname }} maps '{{ hadoop_self_addr }}'
+      to a loopback address ({{ hadoop_hosts_loopback.stdout_lines | default([]) | join(' | ') }}).
+      Remove that alias or the daemons on this node will not be reachable.
+  when:
+    - hadoop_hosts_loopback.stdout is defined
+    - hadoop_hosts_loopback.stdout is search('(^|\s)' ~ (hadoop_self_addr | regex_escape) ~ '(\s|$)', multiline=true)
+
+- name: Hosts | Publish the cluster nodes
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    marker: "# {mark} HADOOP CLUSTER {{ hadoop_cluster_name }} (managed by ansible)"
+    block: |
+      {% for h in hadoop_all_hosts if hadoop_node_map[h].hosts_entry %}
+      {{ hadoop_node_map[h].ip }} {{ hadoop_node_map[h].name }}
+      {% endfor %}
+    state: "{{ 'present' if (hadoop_node_map.values() | selectattr('hosts_entry') | list | length > 0) else 'absent' }}"

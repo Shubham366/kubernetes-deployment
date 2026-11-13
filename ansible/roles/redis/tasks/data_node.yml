@@ -1,0 +1,36 @@
+---
+# Full install of a redis data node (standalone master, replication master,
+# replica or cluster member). Safe to re-run.
+
+- name: Data node | load variables
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Data node | summary
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} ({{ __redis_self_addr }}, {{ ansible_distribution }} {{ ansible_distribution_version }}):
+      redis {{ redis_version }} via {{ redis_install_method }}, mode={{ redis_mode }},
+      role={{ 'cluster-node' if redis_mode == 'cluster' else ('replica of ' ~ __redis_master_addr if __redis_is_replica else 'master') }},
+      port={{ redis_port }}, bind="{{ __redis_bind_effective }}"
+
+- name: Data node | kernel tuning
+  ansible.builtin.include_tasks: kernel.yml
+  when: redis_manage_kernel | bool
+
+- name: Data node | install binaries
+  ansible.builtin.include_tasks: install.yml
+
+- name: Data node | firewall
+  ansible.builtin.include_tasks: firewall.yml
+  vars:
+    __redis_fw_state: open
+  when: redis_manage_firewall | bool
+
+- name: Data node | SELinux
+  ansible.builtin.include_tasks: selinux.yml
+  when:
+    - redis_manage_selinux | bool
+    - ansible_os_family == 'RedHat'
+
+- name: Data node | configuration and service
+  ansible.builtin.include_tasks: configure.yml

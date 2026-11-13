@@ -1,0 +1,122 @@
+---
+# Runs in the context of a REPLICA but every task is delegated to the primary.
+# It makes sure the primary is ready for this particular replica:
+#
+#   * the replication role exists and has the expected password
+#   * a physical replication slot for this replica exists
+#   * pg_hba.conf on the primary lets this replica connect for replication
+#
+# Doing this from the replica's side (instead of a separate play on the
+# primary) is what makes `add_replica` self-contained: it works for a primary
+# that was installed standalone, and when the backend narrows the run to the
+# new hosts with target_hosts.
+#
+# The primary may run a different OS family than this replica, so nothing
+# here uses the OS specific paths of the current host: psql comes from the
+# PATH and the pg_hba.conf location is asked from the server.
+# throttle: 1 serialises the tasks when several replicas are built in
+# parallel (they would otherwise edit the same pg_hba.conf concurrently).
+
+- name: Primary prep | primary is up and not in recovery
+  ansible.builtin.command: "{{ __pg_psql_primary }}"
+  args:
+    stdin: "SELECT pg_is_in_recovery();"
+  delegate_to: "{{ __pg_primary_host }}"
+  become: true
+  become_user: postgres
+  register: __pg_prep_recovery
+  changed_when: false
+  failed_when: __pg_prep_recovery.rc != 0 or (__pg_prep_recovery.stdout | trim) != 'f'
+
+- name: Primary prep | replication settings on the primary
+  ansible.builtin.command: "{{ __pg_psql_primary }}"
+  args:
+    stdin: "SELECT current_setting('wal_level') || '|' || current_setting('max_wal_senders') || '|' || current_setting('max_replication_slots');"
+  delegate_to: "{{ __pg_primary_host }}"
+  become: true
+  become_user: postgres
+  register: __pg_prep_settings
+  changed_when: false
+
+- name: Primary prep | primary must allow streaming replication
+  ansible.builtin.assert:
+    that:
+      - (__pg_prep_settings.stdout | trim).split('|')[0] in ['replica', 'logical']
+      - (__pg_prep_settings.stdout | trim).split('|')[1] | int > 0
+      - (__pg_prep_settings.stdout | trim).split('|')[2] | int > 0
+    fail_msg: >-
+      The primary is not configured for streaming replication
+      (wal_level|max_wal_senders|max_replication_slots = {{ __pg_prep_settings.stdout | trim }}).
+      Re-run postgresql_action=install on the primary first.
+    quiet: true
+
+- name: Primary prep | replication role
+  ansible.builtin.command: "{{ __pg_psql_primary }}"
+  args:
+    stdin: |
+      DO $ansible$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = '{{ postgresql_replication_user }}') THEN
+          CREATE ROLE "{{ postgresql_replication_user }}" LOGIN REPLICATION;
+          RAISE NOTICE 'ANSIBLE_ROLE_CREATED';
+        END IF;
+      END
+      $ansible$;
+      ALTER ROLE "{{ postgresql_replication_user }}" WITH LOGIN REPLICATION PASSWORD '{{ postgresql_replication_password | string | replace("'", "''") }}';
+  delegate_to: "{{ __pg_primary_host }}"
+  become: true
+  become_user: postgres
+  throttle: 1
+  register: __pg_prep_role
+  changed_when: "'ANSIBLE_ROLE_CREATED' in __pg_prep_role.stderr"
+  no_log: true
+
+# A slot makes the primary keep the WAL this replica still needs, however
+# long the base backup takes or the replica is down. (The flip side: a
+# replica that is gone for good must have its slot dropped or the primary's
+# pg_wal grows without bound.)
+- name: Primary prep | replication slot {{ __pg_slot_name }}
+  ansible.builtin.command: "{{ __pg_psql_primary }}"
+  args:
+    stdin: >-
+      SELECT 'created' FROM pg_create_physical_replication_slot('{{ __pg_slot_name }}')
+      WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '{{ __pg_slot_name }}');
+  delegate_to: "{{ __pg_primary_host }}"
+  become: true
+  become_user: postgres
+  throttle: 1
+  register: __pg_prep_slot
+  changed_when: "'created' in __pg_prep_slot.stdout"
+
+- name: Primary prep | locate pg_hba.conf on the primary
+  ansible.builtin.command: "{{ __pg_psql_primary }}"
+  args:
+    stdin: "SHOW hba_file;"
+  delegate_to: "{{ __pg_primary_host }}"
+  become: true
+  become_user: postgres
+  register: __pg_prep_hba_file
+  changed_when: false
+
+# Same line format as templates/pg_hba.conf.j2, so a later full re-render of
+# the primary's pg_hba.conf produces exactly this entry again.
+- name: Primary prep | allow this replica in the primary's pg_hba.conf
+  ansible.builtin.lineinfile:
+    path: "{{ __pg_prep_hba_file.stdout | trim }}"
+    line: "{{ __pg_self_hba_line }}"
+    insertafter: EOF
+    state: present
+  delegate_to: "{{ __pg_primary_host }}"
+  become: true
+  throttle: 1
+  register: __pg_prep_hba
+
+- name: Primary prep | reload the primary after the pg_hba.conf change
+  ansible.builtin.command: "{{ __pg_psql_primary }}"
+  args:
+    stdin: "SELECT pg_reload_conf();"
+  delegate_to: "{{ __pg_primary_host }}"
+  become: true
+  become_user: postgres
+  changed_when: true
+  when: __pg_prep_hba is changed

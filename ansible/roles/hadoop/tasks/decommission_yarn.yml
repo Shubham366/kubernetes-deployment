@@ -1,0 +1,31 @@
+---
+# =============================================================================
+# Graceful NodeManager decommission - runs once on the first ResourceManager.
+#
+# `-refreshNodes -g <seconds> -client` puts the nodes listed in yarn.exclude
+# into DECOMMISSIONING, lets running containers finish, and returns when they
+# are DECOMMISSIONED or the timeout expires (then they are forced out).
+# The command can legitimately run for a long time, hence async.
+# =============================================================================
+
+- name: Decommission | Gracefully drain the NodeManagers
+  ansible.builtin.command:
+    cmd: "{{ hadoop_yarn }} rmadmin -refreshNodes -g {{ hadoop_decommission_timeout | int }} -client"
+  become: true
+  become_user: "{{ hadoop_user }}"
+  async: "{{ (hadoop_decommission_timeout | int) + 300 }}"
+  poll: 15
+  changed_when: true
+
+- name: Decommission | YARN node states
+  ansible.builtin.command:
+    cmd: "{{ hadoop_yarn }} node -list -all"
+  become: true
+  become_user: "{{ hadoop_user }}"
+  register: hadoop_decom_yarn_nodes
+  changed_when: false
+  failed_when: false
+
+- name: Decommission | YARN result
+  ansible.builtin.debug:
+    msg: "{{ hadoop_decom_yarn_nodes.stdout_lines | default([]) }}"

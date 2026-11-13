@@ -1,0 +1,43 @@
+# {{ ansible_managed }}
+#
+# PostgreSQL client authentication - {{ inventory_hostname }}
+# The first matching line wins.
+{# Address in pg_hba notation: bare IPv4 -> /32, bare IPv6 -> /128, DNS names as they are. #}
+{% macro hba_addr(a) -%}
+{% if a is match(__pg_ipv4_re) %}{{ a }}/32{% elif ':' in a %}{{ a }}/128{% else %}{{ a }}{% endif %}
+{%- endmacro %}
+#
+# TYPE  DATABASE  USER  ADDRESS  METHOD
+
+# --- local (unix socket) ------------------------------------------------------
+# The role administers the server as OS user postgres over the socket.
+local all postgres peer
+local all all peer
+local replication all peer
+
+# --- loopback -----------------------------------------------------------------
+host all all 127.0.0.1/32 {{ postgresql_auth_method }}
+host all all ::1/128 {{ postgresql_auth_method }}
+host replication {{ postgresql_replication_user }} 127.0.0.1/32 {{ postgresql_auth_method }}
+
+# --- streaming replication between the cluster nodes ---------------------------
+# Every node lists every node (primary included): after a promote the old
+# primary and the other standbys must be able to connect to the new primary.
+{% for node in __pg_all_nodes %}
+host replication {{ postgresql_replication_user }} {{ hba_addr(hostvars[node].ansible_host | default(node)) }} {{ postgresql_auth_method }}
+{% endfor %}
+{% for cidr in postgresql_replication_allowed_cidrs %}
+host replication {{ postgresql_replication_user }} {{ cidr }} {{ postgresql_auth_method }}
+{% endfor %}
+
+# --- cluster nodes as ordinary clients (pg_rewind, monitoring) -------------------
+{% for node in __pg_all_nodes %}
+host all all {{ hba_addr(hostvars[node].ansible_host | default(node)) }} {{ postgresql_auth_method }}
+{% endfor %}
+
+# --- application networks (postgresql_allowed_cidrs) ---------------------------
+{% for cidr in postgresql_allowed_cidrs %}
+host all all {{ cidr }} {{ postgresql_auth_method }}
+{% else %}
+# none configured
+{% endfor %}

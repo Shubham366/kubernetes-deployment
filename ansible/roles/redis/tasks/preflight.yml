@@ -1,0 +1,214 @@
+---
+# Topology / input validation. Uses no facts (the preflight play does not
+# gather any) and every check is run_once: the answer is the same for all hosts.
+
+- name: Preflight | action, mode and enumerated options are valid
+  ansible.builtin.assert:
+    that:
+      - redis_action in ['install', 'start', 'stop', 'restart', 'status', 'uninstall', 'scale_out']
+      - redis_mode in ['standalone', 'replication', 'sentinel', 'cluster']
+      - redis_install_method in ['package', 'source']
+      - redis_persistence in ['rdb', 'aof', 'both', 'none']
+    fail_msg: >-
+      Invalid input: redis_action={{ redis_action }}, redis_mode={{ redis_mode }},
+      redis_install_method={{ redis_install_method }}, redis_persistence={{ redis_persistence }}
+    quiet: true
+  run_once: true
+
+- name: Preflight | ports are sane
+  ansible.builtin.assert:
+    that:
+      - (redis_port | int) > 0 and (redis_port | int) < 65536
+      - (redis_sentinel_port | int) > 0 and (redis_sentinel_port | int) < 65536
+      - (redis_port | int) != (redis_sentinel_port | int)
+      # cluster bus port is data port + 10000
+      - redis_mode != 'cluster' or (redis_port | int) <= 55535
+      - redis_mode != 'cluster' or (redis_sentinel_port | int) != (redis_port | int) + 10000
+    fail_msg: "Invalid redis_port ({{ redis_port }}) / redis_sentinel_port ({{ redis_sentinel_port }}) for mode {{ redis_mode }}"
+    quiet: true
+  run_once: true
+
+- name: Preflight | a host cannot be both master and replica
+  ansible.builtin.assert:
+    that:
+      - __redis_master_group | intersect(__redis_replica_group) | length == 0
+    fail_msg: "Hosts in both redis_master and redis_replica: {{ __redis_master_group | intersect(__redis_replica_group) }}"
+    quiet: true
+  run_once: true
+
+- name: Preflight | install-time input validation
+  when: redis_action in ['install', 'scale_out']
+  run_once: true
+  block:
+    - name: Preflight | redis_version looks like x.y.z
+      ansible.builtin.assert:
+        that:
+          - redis_version | string is match('^[0-9]+\.[0-9]+(\.[0-9]+)?(-rc[0-9]+)?$')
+        fail_msg: "redis_version '{{ redis_version }}' is not a valid version (expected e.g. 7.2.5)"
+        quiet: true
+      when: redis_install_method == 'source'
+
+    - name: Preflight | source builds need Redis >= 5 (replicaof, redis-cli --cluster)
+      ansible.builtin.assert:
+        that:
+          - (redis_version | string).split('.')[0] | int >= 5
+        fail_msg: "redis_version {{ redis_version }} is too old; this role supports Redis 5.0 and newer"
+        quiet: true
+      when: redis_install_method == 'source'
+
+    - name: Preflight | redis_maxmemory format
+      ansible.builtin.assert:
+        that:
+          - redis_maxmemory | string | lower is match('^[0-9]+(b|k|kb|m|mb|g|gb)?$')
+        fail_msg: "redis_maxmemory '{{ redis_maxmemory }}' is invalid (examples: 2gb, 512mb, 1073741824)"
+        quiet: true
+      when: redis_maxmemory | string | length > 0
+
+    - name: Preflight | redis_maxmemory_policy is a known policy
+      ansible.builtin.assert:
+        that:
+          - redis_maxmemory_policy in ['noeviction', 'allkeys-lru', 'allkeys-lfu', 'allkeys-random', 'volatile-lru', 'volatile-lfu', 'volatile-random', 'volatile-ttl']
+        fail_msg: "Unknown redis_maxmemory_policy '{{ redis_maxmemory_policy }}'"
+        quiet: true
+
+    # The password is written double-quoted into redis.conf / sentinel.conf.
+    - name: Preflight | password has no characters that break the config files
+      ansible.builtin.assert:
+        that:
+          - redis_password | string is not search('["\\s\\\\]')
+        fail_msg: "redis_password must not contain whitespace, double quotes or backslashes"
+        quiet: true
+      # (the result only contains the expression above, never the password)
+      when: redis_password | string | length > 0
+
+    - name: Preflight | redis_extra_config is a mapping
+      ansible.builtin.assert:
+        that:
+          - redis_extra_config is mapping
+        fail_msg: "redis_extra_config must be a dict of directive -> value"
+        quiet: true
+
+# ---------------------------------------------------------------------------
+# Per-mode topology
+# ---------------------------------------------------------------------------
+
+- name: Preflight | standalone topology
+  ansible.builtin.assert:
+    that:
+      - __redis_master_group | length >= 1
+      - __redis_replica_group | length == 0
+    fail_msg: >-
+      standalone mode needs at least one host in redis_master and none in redis_replica
+      (masters={{ __redis_master_group | length }}, replicas={{ __redis_replica_group | length }}).
+      Use redis_mode=replication for master + replicas.
+    quiet: true
+  run_once: true
+  when: redis_mode == 'standalone'
+
+- name: Preflight | replication topology
+  ansible.builtin.assert:
+    that:
+      - __redis_master_group | length == 1
+      - __redis_replica_group | length >= 1
+    fail_msg: >-
+      {{ redis_mode }} mode needs exactly one host in redis_master and at least one in redis_replica
+      (masters={{ __redis_master_group | length }}, replicas={{ __redis_replica_group | length }})
+    quiet: true
+  run_once: true
+  when: redis_mode in ['replication', 'sentinel']
+
+- name: Preflight | sentinel topology
+  ansible.builtin.assert:
+    that:
+      - __redis_sentinel_group | length >= 1
+      - (__redis_sentinel_group | length >= 3) or (redis_sentinel_allow_small | bool)
+      - (__redis_sentinel_quorum | int) >= 1
+      - (__redis_sentinel_quorum | int) <= (__redis_sentinel_group | length)
+    fail_msg: >-
+      sentinel mode needs at least 3 hosts in redis_sentinel (found {{ __redis_sentinel_group | length }};
+      set redis_sentinel_allow_small=true to override) and a quorum between 1 and the number of
+      sentinels (quorum={{ __redis_sentinel_quorum }})
+    quiet: true
+  run_once: true
+  when: redis_mode == 'sentinel'
+
+- name: Preflight | warn about an even number of sentinels
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ __redis_sentinel_group | length }} sentinels configured. An odd number is
+      recommended so that a majority survives a network partition.
+  run_once: true
+  when:
+    - redis_mode == 'sentinel'
+    - (__redis_sentinel_group | length) % 2 == 0
+
+- name: Preflight | cluster topology (install)
+  ansible.builtin.assert:
+    that:
+      - (redis_cluster_replicas | int) >= 0
+      # 3 masters minimum, each with redis_cluster_replicas replicas:
+      # replicas=1 -> 6 nodes, replicas=0 -> 3 nodes, replicas=2 -> 9 nodes
+      - (__redis_cluster_group | length) >= (__redis_cluster_min_nodes | int)
+    fail_msg: >-
+      Redis Cluster with redis_cluster_replicas={{ redis_cluster_replicas }} needs at least
+      {{ __redis_cluster_min_nodes }} hosts in redis_cluster, found {{ __redis_cluster_group | length }}
+    quiet: true
+  run_once: true
+  when:
+    - redis_mode == 'cluster'
+    - redis_action == 'install'
+
+- name: Preflight | cluster mode ignores redis_master / redis_replica groups
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: redis_mode=cluster but redis_master/redis_replica groups are not empty.
+      In cluster mode roles are assigned by redis-cli; put all nodes in redis_cluster only.
+  run_once: true
+  when:
+    - redis_mode == 'cluster'
+    - (__redis_master_group + __redis_replica_group) | length > 0
+
+# ---------------------------------------------------------------------------
+# scale_out
+# ---------------------------------------------------------------------------
+
+- name: Preflight | scale_out input
+  when: redis_action == 'scale_out'
+  run_once: true
+  block:
+    - name: Preflight | scale_out is not meaningful for standalone
+      ansible.builtin.assert:
+        that:
+          - redis_mode in ['replication', 'sentinel', 'cluster']
+        fail_msg: "scale_out requires redis_mode replication, sentinel or cluster"
+        quiet: true
+
+    - name: Preflight | redis_new_nodes is set and known to the inventory
+      ansible.builtin.assert:
+        that:
+          - __redis_new_nodes | length > 0
+          - __redis_new_nodes | difference(__redis_data_nodes + __redis_sentinel_group) | length == 0
+        fail_msg: >-
+          scale_out needs redis_new_nodes (list of inventory hostnames) and every one of them
+          must be in redis_cluster / redis_replica / redis_sentinel. Unknown:
+          {{ __redis_new_nodes | difference(__redis_data_nodes + __redis_sentinel_group) }}
+        quiet: true
+
+    - name: Preflight | the master cannot be a "new" node
+      ansible.builtin.assert:
+        that:
+          - __redis_new_nodes | intersect(__redis_master_group) | length == 0
+        fail_msg: "redis_new_nodes must not contain the master ({{ __redis_master_group }})"
+        quiet: true
+      when: redis_mode in ['replication', 'sentinel']
+
+    - name: Preflight | cluster scale_out needs an existing node to join through
+      ansible.builtin.assert:
+        that:
+          - __redis_cluster_existing | length >= 1
+          - __redis_new_nodes | intersect(__redis_cluster_group) | length >= 1
+        fail_msg: >-
+          Cluster scale_out: redis_new_nodes must be members of redis_cluster and at least one
+          redis_cluster host must be an existing (non-new) node.
+        quiet: true
+      when: redis_mode == 'cluster'

@@ -1,0 +1,498 @@
+---
+# =============================================================================
+# Apache Hadoop - multi-node cluster lifecycle
+#
+#   ansible-playbook -i <inventory> playbooks/software/hadoop.yml \
+#       -e hadoop_action=install -e '{"hadoop_ha_enabled": true}'
+#
+# hadoop_action (default: install)
+#   install       prepare nodes, install, configure, format (first time only), start
+#   start         start every daemon in dependency order
+#   stop          stop every daemon in reverse order
+#   restart       rolling restart, one host (or worker batch) at a time
+#   status        per-node service state + jps, hdfs dfsadmin -report, HA state
+#   scale_out     add the workers listed in hadoop_new_nodes to a running cluster
+#   decommission  gracefully drain and stop the workers in hadoop_decommission_nodes
+#   uninstall     stop and remove (data only with hadoop_purge_data=true)
+#
+# Inventory groups (any of them may be empty or missing):
+#   hadoop_namenode, hadoop_standby_namenode, hadoop_journalnode,
+#   hadoop_zookeeper, hadoop_resourcemanager, hadoop_datanode (also runs the
+#   NodeManager), hadoop_historyserver
+#
+# Every play targets <group(s)>:&<target_hosts>; target_hosts defaults to "all".
+# NOTE: target_hosts must use ":" (not ",") to separate several hosts/groups -
+# a comma would split the whole pattern and bypass the group intersection.
+# Cluster-wide actions (install, scale_out, decommission, restart) need the
+# master nodes inside target_hosts; use hadoop_new_nodes / hadoop_decommission_nodes
+# rather than target_hosts to say which workers are affected.
+#
+# How this file is organised
+# --------------------------
+# A play cannot be skipped as a whole, so each play is a stage of one of the
+# workflows and its single include_role is guarded with `when` on the action.
+# Stages that do not belong to the requested action cost one skipped task.
+# The role (roles/hadoop) holds all logic; this file only fixes the ORDER:
+#
+#   install/start : ZooKeeper -> JournalNodes -> primary NameNode (format on
+#                   first install, ZKFC) -> standby NameNodes (bootstrap) ->
+#                   ResourceManagers -> workers -> safe mode / HDFS dirs ->
+#                   history server
+#   stop          : the exact reverse, in one play
+#   restart       : same order as start, serial, waiting for health in between
+#
+# The YAML anchors below (&hadoop_all, &hadoop_nn ...) just avoid repeating
+# the host patterns.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Stage 0 - facts, request validation, preflight
+# -----------------------------------------------------------------------------
+- name: "Hadoop | Validate the request and run preflight checks"
+  hosts: &hadoop_all "hadoop_namenode:hadoop_standby_namenode:hadoop_journalnode:hadoop_zookeeper:hadoop_resourcemanager:hadoop_datanode:hadoop_historyserver:&{{ target_hosts | default('all') }}"
+  gather_facts: true
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Validate extra vars and inventory
+      ansible.builtin.include_role:
+        name: hadoop
+        tasks_from: validate
+
+    - name: Preflight (topology, OS, memory, disk)
+      ansible.builtin.include_role:
+        name: hadoop
+        tasks_from: preflight
+      when: (hadoop_action | default('install')) in ['install', 'scale_out']
+
+# -----------------------------------------------------------------------------
+# Stage 1 - node preparation (install, scale_out)
+#   OS packages, /etc/hosts, sysctl/ulimits/swap/THP, firewall, SELinux, JDK,
+#   hadoop user, passwordless SSH, binaries, configuration, systemd units.
+#   scale_out: full preparation on hadoop_new_nodes only; the existing nodes
+#   just learn the new members (/etc/hosts, ssh config, workers file).
+# -----------------------------------------------------------------------------
+- name: "Hadoop | Prepare the nodes (OS, Java, binaries, configuration, units)"
+  hosts: *hadoop_all
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Prepare node
+      ansible.builtin.include_role:
+        name: hadoop
+        tasks_from: prepare
+      when: (hadoop_action | default('install')) in ['install', 'scale_out']
+
+# -----------------------------------------------------------------------------
+# Stage 2 - ZooKeeper ensemble (HA NameNode / HA ResourceManager)
+#   Install on all members first, start in a second play so the ensemble can
+#   form a quorum immediately.
+# -----------------------------------------------------------------------------
+- name: "Hadoop | ZooKeeper - install and configure (myid, zoo.cfg)"
+  hosts: &hadoop_zk "hadoop_zookeeper:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Install ZooKeeper
+      ansible.builtin.include_role:
+        name: hadoop
+        tasks_from: zookeeper
+      when: (hadoop_action | default('install')) == 'install'
+
+- name: "Hadoop | ZooKeeper - start"
+  hosts: *hadoop_zk
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Start ZooKeeper
+      ansible.builtin.include_role:
+        name: hadoop
+        tasks_from: services
+      vars:
+        hadoop_svc_daemons: [zookeeper]
+        hadoop_svc_state: "{{ hadoop_zk_start_state }}"
+      when: (hadoop_action | default('install')) in ['install', 'start']
+
+# -----------------------------------------------------------------------------
+# Stage 3 - JournalNodes (HA only). A quorum must be up before the NameNode
+#   can be formatted or started.
+# -----------------------------------------------------------------------------
+- name: "Hadoop | JournalNodes - start (HA)"
+  hosts: &hadoop_jn "hadoop_journalnode:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Start JournalNodes
+      ansible.builtin.include_role:
+        name: hadoop
+        tasks_from: services
+      vars:
+        hadoop_svc_daemons: [journalnode]
+        hadoop_svc_state: "{{ hadoop_start_state }}"
+      when:
+        - (hadoop_action | default('install')) in ['install', 'start']
+        - hadoop_ha_enabled | default(false) | bool
+
+# -----------------------------------------------------------------------------
+# Stage 4 - NameNodes
+#   4a primary : format (first install only, guarded - see tasks/namenode.yml),
+#                formatZK, start NameNode, ZKFC (HA) or SecondaryNameNode
+#   4b standby : bootstrapStandby from the now-active primary, start, ZKFC -
+#                one host at a time
+#   The primary is the first host of hadoop_namenode (+ hadoop_standby_namenode).
+# -----------------------------------------------------------------------------
+- name: "Hadoop | Primary NameNode - format (first install) and start"
+  hosts: &hadoop_nn "hadoop_namenode:hadoop_standby_namenode:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Bring up the primary NameNode
+      ansible.builtin.include_role:
+        name: hadoop
+        tasks_from: namenode
+      when:
+        - (hadoop_action | default('install')) in ['install', 'start']
+        - inventory_hostname == ((groups.get('hadoop_namenode', []) + groups.get('hadoop_standby_namenode', [])) | first)
+
+- name: "Hadoop | Standby NameNodes - bootstrap and start (HA)"
+  hosts: *hadoop_nn
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  serial: 1
+  tasks:
+    - name: Bring up a standby NameNode
+      ansible.builtin.include_role:
+        name: hadoop
+        tasks_from: namenode
+      when:
+        - (hadoop_action | default('install')) in ['install', 'start']
+        - hadoop_ha_enabled | default(false) | bool
+        - inventory_hostname != ((groups.get('hadoop_namenode', []) + groups.get('hadoop_standby_namenode', [])) | first)
+
+# -----------------------------------------------------------------------------
+# Stage 5 - ResourceManagers (one at a time, so that with RM HA a re-install
+#   never takes both down together)
+# -----------------------------------------------------------------------------
+- name: "Hadoop | ResourceManagers - start"
+  hosts: &hadoop_rm "hadoop_resourcemanager:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  serial: 1
+  tasks:
+    - name: Start the ResourceManager
+      ansible.builtin.include_role:
+        name: hadoop
+        tasks_from: services
+      vars:
+        hadoop_svc_daemons: [resourcemanager]
+        hadoop_svc_state: "{{ hadoop_start_state }}"
+      when: (hadoop_action | default('install')) in ['install', 'start']
+
+# -----------------------------------------------------------------------------
+# Stage 6 - workers: DataNode + NodeManager
+#   scale_out starts them on the new nodes only.
+# -----------------------------------------------------------------------------
+- name: "Hadoop | Workers - start DataNodes and NodeManagers"
+  hosts: &hadoop_dn "hadoop_datanode:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Start DataNode and NodeManager
+      ansible.builtin.include_role:
+        name: hadoop
+        tasks_from: services
+      vars:
+        hadoop_svc_daemons: [datanode, nodemanager]
+        hadoop_svc_state: "{{ hadoop_start_state }}"
+      when: >-
+        (hadoop_action | default('install')) in ['install', 'start']
+        or ((hadoop_action | default('install')) == 'scale_out'
+            and inventory_hostname in (hadoop_new_nodes | default([], true)))
+
+# -----------------------------------------------------------------------------
+# Stage 7 - post-start on the primary NameNode
+#   wait for safe mode to end; install: create the base HDFS directories;
+#   scale_out: refreshNodes and wait until the new DataNodes are live.
+# -----------------------------------------------------------------------------
+- name: "Hadoop | Post-start - safe mode, HDFS directories, node refresh"
+  hosts: *hadoop_nn
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Post-start tasks
+      ansible.builtin.include_role:
+        name: hadoop
+        tasks_from: post_start
+      when:
+        - (hadoop_action | default('install')) in ['install', 'start', 'scale_out']
+        - inventory_hostname == ((groups.get('hadoop_namenode', []) + groups.get('hadoop_standby_namenode', [])) | first)
+
+# scale_out: make the (active) ResourceManager re-read its node lists too.
+- name: "Hadoop | Scale out - refresh the ResourceManager"
+  hosts: *hadoop_rm
+  gather_facts: false
+  become: true
+  tasks:
+    - name: yarn rmadmin -refreshNodes
+      ansible.builtin.command:
+        cmd: "{{ hadoop_install_dir | default('/opt/hadoop') }}/current/bin/yarn --config {{ hadoop_conf_dir | default('/etc/hadoop/conf') }} rmadmin -refreshNodes"
+      become: true
+      become_user: "{{ hadoop_user | default('hadoop') }}"
+      run_once: true
+      changed_when: true
+      when: (hadoop_action | default('install')) == 'scale_out'
+
+# -----------------------------------------------------------------------------
+# Stage 8 - MapReduce JobHistory server (optional group). Started after HDFS
+#   has left safe mode because it creates /mr-history on startup.
+# -----------------------------------------------------------------------------
+- name: "Hadoop | JobHistory server - start"
+  hosts: &hadoop_jhs "hadoop_historyserver:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Start the JobHistory server
+      ansible.builtin.include_role:
+        name: hadoop
+        tasks_from: services
+      vars:
+        hadoop_svc_daemons: [historyserver]
+        hadoop_svc_state: "{{ hadoop_start_state }}"
+      when: (hadoop_action | default('install')) in ['install', 'start']
+
+# =============================================================================
+# DECOMMISSION
+#   D1 every node : append the nodes to dfs.exclude / yarn.exclude, drop them
+#                   from the workers file
+#   D2 NameNode   : refreshNodes, wait until the DataNodes are "Decommissioned"
+#   D3 RM         : graceful NodeManager decommission (running containers finish)
+#   D4 the nodes  : stop and disable DataNode + NodeManager
+# =============================================================================
+- name: "Hadoop | Decommission - update exclude files on every node"
+  hosts: *hadoop_all
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Update membership files
+      ansible.builtin.include_role:
+        name: hadoop
+        tasks_from: membership
+      when: (hadoop_action | default('install')) == 'decommission'
+
+- name: "Hadoop | Decommission - drain the DataNodes (HDFS re-replication)"
+  hosts: *hadoop_nn
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Decommission DataNodes and wait
+      ansible.builtin.include_role:
+        name: hadoop
+        tasks_from: decommission_hdfs
+      when:
+        - (hadoop_action | default('install')) == 'decommission'
+        - inventory_hostname == ((groups.get('hadoop_namenode', []) + groups.get('hadoop_standby_namenode', [])) | first)
+
+- name: "Hadoop | Decommission - drain the NodeManagers (YARN)"
+  hosts: *hadoop_rm
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Decommission NodeManagers and wait
+      ansible.builtin.include_role:
+        name: hadoop
+        tasks_from: decommission_yarn
+      when:
+        - (hadoop_action | default('install')) == 'decommission'
+        - inventory_hostname == (groups.get('hadoop_resourcemanager', []) | first)
+
+- name: "Hadoop | Decommission - stop the daemons on the drained nodes"
+  hosts: *hadoop_dn
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Stop and disable DataNode and NodeManager
+      ansible.builtin.include_role:
+        name: hadoop
+        tasks_from: services
+      vars:
+        hadoop_svc_daemons: [datanode, nodemanager]
+        hadoop_svc_state: stopped
+        hadoop_svc_enable: false
+      when:
+        - (hadoop_action | default('install')) == 'decommission'
+        - inventory_hostname in (hadoop_decommission_nodes | default([], true))
+        - hadoop_decommission_stop_services | default(true) | bool
+
+# =============================================================================
+# ROLLING RESTART
+#   Same order as a start. `serial` is 1 (or hadoop_rolling_batch for workers)
+#   only when the action really is "restart"; otherwise these plays are no-ops
+#   and run in a single batch so they cost nothing.
+#   ZooKeeper is only bounced with hadoop_restart_zookeeper=true.
+# =============================================================================
+- name: "Hadoop | Rolling restart - ZooKeeper (optional)"
+  hosts: *hadoop_zk
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  serial: "{{ 1 if (hadoop_action | default('install')) == 'restart' else '100%' }}"
+  tasks:
+    - name: Restart ZooKeeper
+      ansible.builtin.include_role:
+        name: hadoop
+        tasks_from: rolling_restart
+      vars:
+        hadoop_svc_daemons: [zookeeper]
+      when:
+        - (hadoop_action | default('install')) == 'restart'
+        - hadoop_restart_zookeeper | default(false) | bool
+
+- name: "Hadoop | Rolling restart - JournalNodes"
+  hosts: *hadoop_jn
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  serial: "{{ 1 if (hadoop_action | default('install')) == 'restart' else '100%' }}"
+  tasks:
+    - name: Restart the JournalNode
+      ansible.builtin.include_role:
+        name: hadoop
+        tasks_from: rolling_restart
+      vars:
+        hadoop_svc_daemons: [journalnode]
+      when: (hadoop_action | default('install')) == 'restart'
+
+# With HA the ZKFC fails over to the other NameNode while this one restarts;
+# the play waits for it to leave safe mode before touching the next one.
+- name: "Hadoop | Rolling restart - NameNodes"
+  hosts: *hadoop_nn
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  serial: "{{ 1 if (hadoop_action | default('install')) == 'restart' else '100%' }}"
+  tasks:
+    - name: Restart NameNode, ZKFC / SecondaryNameNode
+      ansible.builtin.include_role:
+        name: hadoop
+        tasks_from: rolling_restart
+      vars:
+        hadoop_svc_daemons: [namenode, zkfc, secondarynamenode]
+      when: (hadoop_action | default('install')) == 'restart'
+
+- name: "Hadoop | Rolling restart - ResourceManagers"
+  hosts: *hadoop_rm
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  serial: "{{ 1 if (hadoop_action | default('install')) == 'restart' else '100%' }}"
+  tasks:
+    - name: Restart the ResourceManager
+      ansible.builtin.include_role:
+        name: hadoop
+        tasks_from: rolling_restart
+      vars:
+        hadoop_svc_daemons: [resourcemanager]
+      when: (hadoop_action | default('install')) == 'restart'
+
+# A failing batch stops the roll (max_fail_percentage 0) so a bad config can
+# never take out more than one batch of DataNodes.
+- name: "Hadoop | Rolling restart - workers (DataNode + NodeManager)"
+  hosts: *hadoop_dn
+  gather_facts: false
+  become: true
+  max_fail_percentage: 0
+  serial: "{{ (hadoop_rolling_batch | default(1)) if (hadoop_action | default('install')) == 'restart' else '100%' }}"
+  tasks:
+    - name: Restart DataNode and NodeManager
+      ansible.builtin.include_role:
+        name: hadoop
+        tasks_from: rolling_restart
+      vars:
+        hadoop_svc_daemons: [datanode, nodemanager]
+      when: (hadoop_action | default('install')) == 'restart'
+
+- name: "Hadoop | Rolling restart - JobHistory server"
+  hosts: *hadoop_jhs
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Restart the JobHistory server
+      ansible.builtin.include_role:
+        name: hadoop
+        tasks_from: rolling_restart
+      vars:
+        hadoop_svc_daemons: [historyserver]
+      when: (hadoop_action | default('install')) == 'restart'
+
+# =============================================================================
+# STOP (also the first half of uninstall)
+#   One play: tasks/stop_all.yml stops one daemon type per task, so the linear
+#   strategy enforces the reverse start order across the whole cluster.
+# =============================================================================
+- name: "Hadoop | Stop all daemons (reverse dependency order)"
+  hosts: *hadoop_all
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Stop daemons
+      ansible.builtin.include_role:
+        name: hadoop
+        tasks_from: stop_all
+      when: (hadoop_action | default('install')) in ['stop', 'uninstall']
+
+# =============================================================================
+# UNINSTALL
+#   Data directories survive unless hadoop_purge_data=true.
+# =============================================================================
+- name: "Hadoop | Uninstall - remove units, binaries, configuration (and data on request)"
+  hosts: *hadoop_all
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Uninstall
+      ansible.builtin.include_role:
+        name: hadoop
+        tasks_from: uninstall
+      when: (hadoop_action | default('install')) == 'uninstall'
+
+# =============================================================================
+# STATUS
+#   Per node: unit states, ports, jps. Cluster: hdfs dfsadmin -report, HA
+#   state, YARN nodes. Read-only; also appended to install / scale_out /
+#   decommission runs would be redundant with their own reports, so it only
+#   runs for hadoop_action=status.
+# =============================================================================
+- name: "Hadoop | Status - per node (systemd, ports, jps)"
+  hosts: *hadoop_all
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Node status
+      ansible.builtin.include_role:
+        name: hadoop
+        tasks_from: status
+      when: (hadoop_action | default('install')) == 'status'
+
+- name: "Hadoop | Status - cluster (dfsadmin report, HA state, YARN nodes)"
+  hosts: *hadoop_nn
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Cluster status
+      ansible.builtin.include_role:
+        name: hadoop
+        tasks_from: status_cluster
+      when:
+        - (hadoop_action | default('install')) == 'status'
+        - inventory_hostname == ((groups.get('hadoop_namenode', []) + groups.get('hadoop_standby_namenode', [])) | first)

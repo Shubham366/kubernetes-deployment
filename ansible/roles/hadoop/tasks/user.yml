@@ -1,0 +1,51 @@
+---
+# =============================================================================
+# Service account and local directories
+# =============================================================================
+
+- name: User | Group
+  ansible.builtin.group:
+    name: "{{ hadoop_group }}"
+    system: true
+    state: present
+
+# A real shell and home are required: the sshfence fencer logs in as this user
+# and admin commands are run through it.
+- name: User | Account
+  ansible.builtin.user:
+    name: "{{ hadoop_user }}"
+    group: "{{ hadoop_group }}"
+    home: "{{ hadoop_user_home }}"
+    shell: "{{ hadoop_user_shell }}"
+    create_home: true
+    system: true
+    comment: "Apache Hadoop"
+    state: present
+
+- name: User | Installation, configuration and log directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner | default(hadoop_user) }}"
+    group: "{{ item.group | default(hadoop_group) }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ hadoop_install_dir }}", mode: "0755", owner: root, group: root }
+    - { path: "{{ hadoop_dist_dir }}", mode: "0755", owner: root, group: root }
+    - { path: "{{ hadoop_conf_dir }}", mode: "0755" }
+    - { path: "{{ hadoop_log_dir }}", mode: "0775" }
+    - { path: "{{ hadoop_pid_dir }}", mode: "0755" }
+  loop_control:
+    label: "{{ item.path }}"
+
+# Only the directories this host's roles need (NameNode metadata on NameNodes,
+# block storage on DataNodes, ...). 0700: HDFS refuses group/world-readable
+# DataNode directories and the metadata should be private anyway.
+- name: User | Storage directories for the roles of this host
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ hadoop_user }}"
+    group: "{{ hadoop_group }}"
+    mode: "{{ '0755' if item in (hadoop_yarn_local_dirs + hadoop_yarn_log_dirs + [hadoop_tmp_dir]) else '0700' }}"
+  loop: "{{ hadoop_host_storage_dirs }}"

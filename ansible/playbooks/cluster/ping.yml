@@ -1,0 +1,29 @@
+---
+# Connectivity check: SSH reachable, Python usable, privilege escalation works.
+# Extra vars: target_hosts (default all), ping_timeout (default 30).
+- name: Check connectivity to cluster nodes
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Wait for SSH to accept connections
+      ansible.builtin.wait_for_connection:
+        timeout: "{{ ping_timeout | default(30) }}"
+        sleep: 2
+
+    - name: Verify the Python interpreter works
+      ansible.builtin.ping:
+
+    - name: Verify privilege escalation
+      ansible.builtin.command: id -u
+      become: true
+      register: ping_become
+      changed_when: false
+      when: ansible_become | default(true) | bool
+
+    - name: Fail when become did not yield root
+      ansible.builtin.fail:
+        msg: "Privilege escalation on {{ inventory_hostname }} returned uid {{ ping_become.stdout }} instead of 0"
+      when:
+        - ansible_become | default(true) | bool
+        - ping_become.stdout | default('0') != '0'

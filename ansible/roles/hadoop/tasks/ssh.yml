@@ -1,0 +1,101 @@
+---
+# =============================================================================
+# Passwordless SSH for the hadoop user between all cluster nodes
+#
+# Needed by the sshfence HA fencing method (the surviving NameNode logs into
+# the failed one to kill it) and by the stock start-dfs.sh / start-yarn.sh
+# helper scripts.
+#
+# One cluster-wide key pair is used: it is generated once on the primary
+# NameNode, read back, and installed on every node. That keeps scale_out
+# simple - a new node just receives the same pair.
+#
+# The private key travels through Ansible variables, hence no_log everywhere
+# it is handled.
+# =============================================================================
+
+- name: SSH | Generate the cluster key pair on the primary NameNode
+  ansible.builtin.user:
+    name: "{{ hadoop_user }}"
+    generate_ssh_key: true
+    ssh_key_type: rsa
+    ssh_key_bits: 4096
+    ssh_key_file: .ssh/id_rsa
+    ssh_key_comment: "{{ hadoop_user }}@{{ hadoop_cluster_name }}"
+  delegate_to: "{{ hadoop_primary_nn }}"
+  run_once: true
+
+- name: SSH | Read the private key
+  ansible.builtin.slurp:
+    src: "{{ hadoop_ssh_key_file }}"
+  delegate_to: "{{ hadoop_primary_nn }}"
+  run_once: true
+  register: hadoop_ssh_private_key
+  no_log: true
+
+- name: SSH | Read the public key
+  ansible.builtin.slurp:
+    src: "{{ hadoop_ssh_key_file }}.pub"
+  delegate_to: "{{ hadoop_primary_nn }}"
+  run_once: true
+  register: hadoop_ssh_public_key
+
+# The remaining tasks need the account, which only exists on nodes that have
+# been prepared (during scale_out the non-selected nodes already have it).
+- name: SSH | ~/.ssh
+  ansible.builtin.file:
+    path: "{{ hadoop_user_home }}/.ssh"
+    state: directory
+    owner: "{{ hadoop_user }}"
+    group: "{{ hadoop_group }}"
+    mode: "0700"
+
+- name: SSH | Install the private key
+  ansible.builtin.copy:
+    content: "{{ hadoop_ssh_private_key.content | b64decode }}"
+    dest: "{{ hadoop_ssh_key_file }}"
+    owner: "{{ hadoop_user }}"
+    group: "{{ hadoop_group }}"
+    mode: "0600"
+  no_log: true
+  when: hadoop_node_selected | bool
+
+- name: SSH | Install the public key
+  ansible.builtin.copy:
+    content: "{{ hadoop_ssh_public_key.content | b64decode }}"
+    dest: "{{ hadoop_ssh_key_file }}.pub"
+    owner: "{{ hadoop_user }}"
+    group: "{{ hadoop_group }}"
+    mode: "0644"
+  when: hadoop_node_selected | bool
+
+# ansible.builtin has no authorized_key module (it lives in ansible.posix), so
+# the key line is managed with lineinfile.
+- name: SSH | Authorise the cluster key
+  ansible.builtin.lineinfile:
+    path: "{{ hadoop_user_home }}/.ssh/authorized_keys"
+    line: "{{ hadoop_ssh_public_key.content | b64decode | trim }}"
+    create: true
+    owner: "{{ hadoop_user }}"
+    group: "{{ hadoop_group }}"
+    mode: "0600"
+  when: hadoop_node_selected | bool
+
+# Host keys of cluster members are not verified for this service account:
+# fencing must never block on an interactive "are you sure" prompt, and nodes
+# get re-imaged. The relaxation is scoped to the cluster's own names/IPs.
+- name: SSH | Client configuration for the hadoop user
+  ansible.builtin.template:
+    src: ssh_config.j2
+    dest: "{{ hadoop_user_home }}/.ssh/config"
+    owner: "{{ hadoop_user }}"
+    group: "{{ hadoop_group }}"
+    mode: "0600"
+
+- name: SSH | sshd is enabled and running
+  ansible.builtin.systemd:
+    name: "{{ 'ssh' if ansible_os_family == 'Debian' else 'sshd' }}"
+    enabled: true
+    state: started
+  when: hadoop_node_selected | bool
+  failed_when: false

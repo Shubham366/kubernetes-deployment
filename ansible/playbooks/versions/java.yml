@@ -1,0 +1,199 @@
+---
+# Installs, switches or removes a JDK.
+#
+# Extra vars:
+#   java_version         8 | 11 | 17 | 21            (required)
+#   java_state           present | absent            (default present)
+#   java_install_method  package | tarball           (default package)
+#   java_distribution    openjdk | temurin           (tarball always uses Temurin)
+#   java_set_default     make this JDK the system default (default true)
+#   java_tarball_url     override the download URL (air-gapped mirrors)
+#   java_tarball_checksum  e.g. "sha256:abc..."      (optional)
+#   java_install_root    default /opt/java
+- name: Manage the Java runtime
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: true
+  become: true
+  vars:
+    java_state: present
+    java_install_method: package
+    java_distribution: openjdk
+    java_set_default: true
+    java_install_root: /opt/java
+    java_tarball_checksum: ""
+    java_major: "{{ java_version | string }}"
+    java_is_debian: "{{ ansible_facts.os_family == 'Debian' }}"
+    java_arch_adoptium: "{{ 'aarch64' if ansible_facts.architecture in ['aarch64', 'arm64'] else 'x64' }}"
+    java_arch_deb: "{{ 'arm64' if ansible_facts.architecture in ['aarch64', 'arm64'] else 'amd64' }}"
+    java_rpm_name: "{{ 'java-1.8.0-openjdk' if java_major == '8' else 'java-' ~ java_major ~ '-openjdk' }}"
+    java_packages: >-
+      {{ ['openjdk-' ~ java_major ~ '-jdk-headless'] if java_is_debian
+         else [java_rpm_name ~ '-devel', java_rpm_name ~ '-headless'] }}
+    java_tarball_home: "{{ java_install_root }}/jdk-{{ java_major }}"
+    java_package_home: >-
+      {{ '/usr/lib/jvm/java-' ~ java_major ~ '-openjdk-' ~ java_arch_deb if java_is_debian
+         else '/usr/lib/jvm/' ~ java_rpm_name }}
+    java_home: "{{ java_tarball_home if java_install_method == 'tarball' else java_package_home }}"
+    java_default_url: >-
+      https://api.adoptium.net/v3/binary/latest/{{ java_major }}/ga/linux/{{ java_arch_adoptium }}/jdk/hotspot/normal/eclipse
+  tasks:
+    - name: Validate input
+      ansible.builtin.assert:
+        that:
+          - java_version is defined
+          - java_major is match('^[0-9]+$')
+          - java_state in ['present', 'absent']
+          - java_install_method in ['package', 'tarball']
+          - ansible_facts.os_family in ['Debian', 'RedHat']
+        fail_msg: "Invalid java_* variables or unsupported OS family {{ ansible_facts.os_family }}"
+
+    # ------------------------------------------------------------- install
+    - name: Install from distribution packages
+      when:
+        - java_state == 'present'
+        - java_install_method == 'package'
+      block:
+        - name: Refresh the apt cache
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: 3600
+          when: java_is_debian
+
+        - name: Install the JDK package
+          ansible.builtin.package:
+            name: "{{ java_packages }}"
+            state: present
+          register: java_pkg
+          retries: 2
+          delay: 10
+          until: java_pkg is succeeded
+
+      rescue:
+        - name: Explain the package failure
+          ansible.builtin.fail:
+            msg: >-
+              JDK {{ java_major }} could not be installed from packages on
+              {{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }}.
+              It may not be packaged for this release - retry with java_install_method=tarball.
+
+    - name: Install from the Temurin tarball
+      when:
+        - java_state == 'present'
+        - java_install_method == 'tarball'
+      block:
+        - name: Install tarball prerequisites
+          ansible.builtin.package:
+            name: [tar, gzip, ca-certificates]
+            state: present
+
+        - name: Create the install directory
+          ansible.builtin.file:
+            path: "{{ java_tarball_home }}"
+            state: directory
+            mode: "0755"
+
+        - name: Check for an existing JDK in the install directory
+          ansible.builtin.stat:
+            path: "{{ java_tarball_home }}/bin/java"
+          register: java_existing
+
+        - name: Download the JDK
+          ansible.builtin.get_url:
+            url: "{{ java_tarball_url | default(java_default_url) }}"
+            dest: "/tmp/jdk-{{ java_major }}.tar.gz"
+            mode: "0644"
+            checksum: "{{ java_tarball_checksum | default(omit, true) }}"
+            timeout: 120
+          register: java_download
+          retries: 3
+          delay: 15
+          until: java_download is succeeded
+          when: not java_existing.stat.exists
+
+        - name: Unpack the JDK
+          ansible.builtin.unarchive:
+            src: "/tmp/jdk-{{ java_major }}.tar.gz"
+            dest: "{{ java_tarball_home }}"
+            remote_src: true
+            extra_opts: ["--strip-components=1"]
+          when: not java_existing.stat.exists
+
+        - name: Remove the downloaded archive
+          ansible.builtin.file:
+            path: "/tmp/jdk-{{ java_major }}.tar.gz"
+            state: absent
+
+    - name: Verify the JDK
+      ansible.builtin.command: "{{ java_home }}/bin/java -version"
+      register: java_verify
+      changed_when: false
+      when: java_state == 'present'
+
+    - name: Check that the installed major version matches
+      ansible.builtin.assert:
+        that: >-
+          (java_verify.stderr ~ java_verify.stdout) is search('version "' ~ ('1.8' if java_major == '8' else java_major))
+        fail_msg: "{{ java_home }} does not contain JDK {{ java_major }}: {{ java_verify.stderr | default('') }}"
+      when: java_state == 'present'
+
+    # ---------------------------------------------------- default selection
+    - name: Make this JDK the system default
+      when:
+        - java_state == 'present'
+        - java_set_default | bool
+      block:
+        - name: Register java and javac with alternatives
+          ansible.builtin.command: >-
+            update-alternatives --install /usr/bin/{{ item }} {{ item }} {{ java_home }}/bin/{{ item }}
+            {{ 1000 + java_major | int }}
+          loop: [java, javac, jar, keytool]
+          changed_when: false
+
+        - name: Select this JDK in alternatives
+          ansible.builtin.command: "update-alternatives --set {{ item }} {{ java_home }}/bin/{{ item }}"
+          loop: [java, javac, jar, keytool]
+          changed_when: false
+
+        - name: Export JAVA_HOME for login shells
+          ansible.builtin.copy:
+            dest: /etc/profile.d/java.sh
+            mode: "0644"
+            content: |
+              # Managed by the provisioning backend
+              export JAVA_HOME={{ java_home }}
+              export PATH=$JAVA_HOME/bin:$PATH
+
+    # -------------------------------------------------------------- removal
+    - name: Remove the JDK
+      when: java_state == 'absent'
+      block:
+        - name: Drop alternatives entries pointing at this JDK
+          ansible.builtin.command: "update-alternatives --remove {{ item.0 }} {{ item.1 }}/bin/{{ item.0 }}"
+          loop: "{{ ['java', 'javac', 'jar', 'keytool'] | product([java_tarball_home, java_package_home]) | list }}"
+          changed_when: false
+          failed_when: false
+
+        - name: Remove the JDK packages
+          ansible.builtin.package:
+            name: "{{ java_packages }}"
+            state: absent
+
+        - name: Remove the tarball installation
+          ansible.builtin.file:
+            path: "{{ java_tarball_home }}"
+            state: absent
+
+        - name: Read the JAVA_HOME profile snippet
+          ansible.builtin.slurp:
+            src: /etc/profile.d/java.sh
+          register: java_profile
+          failed_when: false
+
+        - name: Remove the profile snippet if it points at the removed JDK
+          ansible.builtin.file:
+            path: /etc/profile.d/java.sh
+            state: absent
+          when:
+            - java_profile.content is defined
+            - (java_profile.content | b64decode) is search(java_tarball_home) or
+              (java_profile.content | b64decode) is search(java_package_home)

@@ -1,0 +1,36 @@
+---
+# Creates the database cluster on the PRIMARY (or a standalone server).
+# Never touches an existing cluster: both variants are guarded by `creates`.
+
+- name: Initdb | is the data directory already initialised
+  ansible.builtin.stat:
+    path: "{{ __pg_data_dir }}/PG_VERSION"
+  register: __pg_version_file
+
+# pg_createcluster <ver> <name> creates data dir + /etc/postgresql/<ver>/main
+# and registers the cluster with postgresql-common (pg_lsclusters, the
+# postgresql@<ver>-main unit). Everything after `--` goes to initdb.
+- name: Initdb | pg_createcluster (Debian)
+  ansible.builtin.command:
+    cmd: >-
+      pg_createcluster {{ __pg_version }} main
+      -d {{ __pg_data_dir }} -p {{ postgresql_port }}
+      -- {{ postgresql_initdb_args }}
+    creates: "{{ __pg_conf_file }}"
+  when: ansible_os_family == 'Debian'
+
+# postgresql-<ver>-setup reads PGDATA from the systemd unit (including our
+# drop-in for a custom data dir) and runs initdb as postgres.
+- name: Initdb | postgresql-{{ __pg_version }}-setup initdb (RedHat)
+  ansible.builtin.command:
+    cmd: "{{ __pg_bin_dir }}/postgresql-{{ __pg_version }}-setup initdb"
+    creates: "{{ __pg_data_dir }}/PG_VERSION"
+  environment:
+    PGSETUP_INITDB_OPTIONS: "{{ postgresql_initdb_args }}"
+  when: ansible_os_family == 'RedHat'
+
+- name: Initdb | verify the cluster exists
+  ansible.builtin.stat:
+    path: "{{ __pg_data_dir }}/PG_VERSION"
+  register: __pg_version_file_after
+  failed_when: not __pg_version_file_after.stat.exists

@@ -1,0 +1,413 @@
+---
+# Baseline OS configuration applied to every node before software is deployed.
+# Works on Debian family (Ubuntu, Debian) and RedHat family (CentOS, RHEL,
+# Rocky, AlmaLinux). Every section can be switched off through its variable.
+#
+# Extra vars (all optional, defaults below):
+#   bootstrap_timezone, bootstrap_packages, bootstrap_manage_hosts_file,
+#   bootstrap_cluster_hosts [{hostname, address}], bootstrap_set_hostname,
+#   bootstrap_ntp_enabled, bootstrap_ntp_servers, bootstrap_disable_swap,
+#   bootstrap_upgrade_packages, bootstrap_selinux_state, bootstrap_firewall_enabled,
+#   bootstrap_sysctl, bootstrap_nofile_limit, bootstrap_admin_user,
+#   bootstrap_admin_ssh_public_key
+- name: Bootstrap cluster nodes
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: true
+  become: true
+  vars:
+    bootstrap_timezone: UTC
+    bootstrap_packages: []
+    bootstrap_manage_hosts_file: true
+    bootstrap_cluster_hosts: []
+    bootstrap_set_hostname: true
+    bootstrap_ntp_enabled: true
+    bootstrap_ntp_servers: []
+    bootstrap_disable_swap: false
+    bootstrap_upgrade_packages: false
+    bootstrap_selinux_state: ""
+    bootstrap_sysctl: {}
+    bootstrap_nofile_limit: 65536
+    bootstrap_admin_user: ""
+    bootstrap_admin_ssh_public_key: ""
+    bootstrap_is_debian: "{{ ansible_facts.os_family == 'Debian' }}"
+    bootstrap_is_redhat: "{{ ansible_facts.os_family == 'RedHat' }}"
+    bootstrap_el_major: "{{ ansible_facts.distribution_major_version | int }}"
+    bootstrap_base_packages_debian:
+      - ca-certificates
+      - curl
+      - wget
+      - gnupg
+      - tar
+      - unzip
+      - rsync
+      - chrony
+      - python3
+      - python3-apt
+      - lsb-release
+      - net-tools
+      - iproute2
+      - acl
+      - sudo
+    bootstrap_base_packages_redhat:
+      - ca-certificates
+      - curl
+      - wget
+      - gnupg2
+      - tar
+      - unzip
+      - rsync
+      - chrony
+      - net-tools
+      - iproute
+      - acl
+      - sudo
+      - which
+  tasks:
+    # ------------------------------------------------------------ preflight
+    - name: Refuse unsupported operating systems
+      ansible.builtin.assert:
+        that: bootstrap_is_debian or bootstrap_is_redhat
+        fail_msg: >-
+          {{ inventory_hostname }} runs {{ ansible_facts.distribution }} ({{ ansible_facts.os_family }}),
+          which is not supported. Supported families: Debian, RedHat.
+
+    - name: Warn when the declared OS differs from the detected one
+      ansible.builtin.debug:
+        msg: >-
+          Declared OS '{{ declared_os | default('n/a') }}' but detected
+          {{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }}.
+          Run 'cluster facts' to correct the inventory.
+      when:
+        - declared_os is defined
+        - (declared_os in ['ubuntu', 'debian']) != bootstrap_is_debian
+
+    - name: Check free space on the root filesystem
+      ansible.builtin.assert:
+        that: (item.size_available | int) > 1073741824
+        fail_msg: "Less than 1 GiB free on / of {{ inventory_hostname }}"
+      loop: "{{ ansible_facts.mounts | selectattr('mount', 'equalto', '/') | list }}"
+      loop_control:
+        label: "{{ item.mount }}"
+
+    # ------------------------------------------------------------- hostname
+    - name: Set the hostname
+      ansible.builtin.hostname:
+        name: "{{ inventory_hostname }}"
+      when:
+        - bootstrap_set_hostname | bool
+        - ansible_facts.hostname != inventory_hostname.split('.')[0]
+
+    - name: Keep cloud-init from resetting the hostname
+      ansible.builtin.lineinfile:
+        path: /etc/cloud/cloud.cfg
+        regexp: '^preserve_hostname:'
+        line: "preserve_hostname: true"
+      when: bootstrap_set_hostname | bool
+      failed_when: false
+
+    - name: Publish every cluster member in /etc/hosts
+      ansible.builtin.blockinfile:
+        path: /etc/hosts
+        marker: "# {mark} PROVISIONER CLUSTER {{ provisioner_cluster_name | default('cluster') }}"
+        block: |
+          {% for member in bootstrap_cluster_hosts %}
+          {% if member.address | regex_search('^[0-9a-fA-F:.]+$') %}
+          {{ member.address }} {{ member.hostname }} {{ member.hostname.split('.')[0] }}
+          {% endif %}
+          {% endfor %}
+      when:
+        - bootstrap_manage_hosts_file | bool
+        - bootstrap_cluster_hosts | length > 0
+
+    - name: Remove the 127.0.1.1 hostname alias (breaks Hadoop and replication binds)
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: '^127\.0\.1\.1\s'
+        state: absent
+      when: bootstrap_manage_hosts_file | bool
+
+    # ------------------------------------------------------------- packages
+    - name: Debian family packages
+      when: bootstrap_is_debian
+      block:
+        - name: Wait for unattended apt/dpkg runs to finish
+          ansible.builtin.shell: |
+            for i in $(seq 1 60); do
+              if ! pgrep -x apt-get >/dev/null && ! pgrep -x dpkg >/dev/null && ! pgrep -f unattended-upgr >/dev/null; then
+                exit 0
+              fi
+              sleep 5
+            done
+            exit 1
+          changed_when: false
+
+        - name: Refresh the apt cache
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: 3600
+          register: bootstrap_apt_update
+          retries: 3
+          delay: 10
+          until: bootstrap_apt_update is succeeded
+
+        - name: Upgrade all packages (Debian family)
+          ansible.builtin.apt:
+            upgrade: dist
+          when: bootstrap_upgrade_packages | bool
+
+        - name: Install base packages (Debian family)
+          ansible.builtin.apt:
+            name: "{{ bootstrap_base_packages_debian + bootstrap_packages }}"
+            state: present
+          environment:
+            DEBIAN_FRONTEND: noninteractive
+
+    - name: RedHat family packages
+      when: bootstrap_is_redhat
+      block:
+        - name: Point CentOS 7 at the vault (the release is end-of-life)
+          ansible.builtin.shell: |
+            set -e
+            if grep -q '^mirrorlist=' /etc/yum.repos.d/CentOS-Base.repo 2>/dev/null; then
+              sed -i -e 's|^mirrorlist=|#mirrorlist=|' \
+                     -e 's|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|' \
+                     /etc/yum.repos.d/CentOS-*.repo
+              echo changed
+            fi
+          register: bootstrap_vault
+          changed_when: "'changed' in bootstrap_vault.stdout"
+          when:
+            - ansible_facts.distribution == 'CentOS'
+            - bootstrap_el_major | int == 7
+
+        - name: Check the RHEL subscription
+          ansible.builtin.command: subscription-manager status
+          register: bootstrap_subscription
+          changed_when: false
+          failed_when: false
+          when: ansible_facts.distribution == 'RedHat'
+
+        - name: Report an unregistered RHEL system
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }} is not registered with subscription-manager; package
+              installation will only work if other repositories are configured.
+          when:
+            - ansible_facts.distribution == 'RedHat'
+            - bootstrap_subscription.rc | default(0) != 0
+
+        - name: Install EPEL
+          ansible.builtin.package:
+            name: epel-release
+            state: present
+          when: ansible_facts.distribution != 'RedHat'
+          failed_when: false
+
+        - name: Upgrade all packages (RedHat family)
+          ansible.builtin.package:
+            name: "*"
+            state: latest  # noqa: package-latest
+          when: bootstrap_upgrade_packages | bool
+
+        - name: Install base packages (RedHat family)
+          ansible.builtin.package:
+            name: "{{ bootstrap_base_packages_redhat + bootstrap_packages }}"
+            state: present
+
+        - name: Install the SELinux Python bindings
+          ansible.builtin.package:
+            name: "{{ 'libselinux-python' if bootstrap_el_major | int == 7 else 'python3-libselinux' }}"
+            state: present
+          failed_when: false
+
+    # ----------------------------------------------------------------- time
+    - name: Set the timezone
+      ansible.builtin.command: "timedatectl set-timezone {{ bootstrap_timezone | quote }}"
+      when:
+        - bootstrap_timezone | length > 0
+        - ansible_facts.date_time.tz_dst is defined
+      register: bootstrap_tz
+      changed_when: false
+
+    - name: Time synchronisation
+      when: bootstrap_ntp_enabled | bool
+      vars:
+        bootstrap_chrony_conf: "{{ '/etc/chrony/chrony.conf' if bootstrap_is_debian else '/etc/chrony.conf' }}"
+        bootstrap_chrony_service: "{{ 'chrony' if bootstrap_is_debian else 'chronyd' }}"
+      block:
+        - name: Configure custom NTP servers
+          ansible.builtin.blockinfile:
+            path: "{{ bootstrap_chrony_conf }}"
+            marker: "# {mark} PROVISIONER NTP"
+            block: |
+              {% for server in bootstrap_ntp_servers %}
+              server {{ server }} iburst
+              {% endfor %}
+          when: bootstrap_ntp_servers | length > 0
+          register: bootstrap_chrony_changed
+
+        - name: Disable the distribution pool when custom servers are set
+          ansible.builtin.replace:
+            path: "{{ bootstrap_chrony_conf }}"
+            regexp: '^(pool\s.*)$'
+            replace: '# \1'
+          when: bootstrap_ntp_servers | length > 0
+
+        - name: Stop systemd-timesyncd so it does not fight chrony
+          ansible.builtin.systemd:
+            name: systemd-timesyncd
+            state: stopped
+            enabled: false
+          failed_when: false
+
+        - name: Enable and start chrony
+          ansible.builtin.systemd:
+            name: "{{ bootstrap_chrony_service }}"
+            state: "{{ 'restarted' if bootstrap_chrony_changed is changed else 'started' }}"
+            enabled: true
+
+    # --------------------------------------------------------------- kernel
+    - name: Disable swap now
+      ansible.builtin.command: swapoff -a
+      when:
+        - bootstrap_disable_swap | bool
+        - ansible_facts.swaptotal_mb | default(0) | int > 0
+      changed_when: true
+
+    - name: Disable swap permanently
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^([^#\n]\S*\s+\S+\s+swap\s+.*)$'
+        replace: '# \1'
+      when: bootstrap_disable_swap | bool
+
+    - name: Write provisioner sysctl settings
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/90-provisioner.conf
+        mode: "0644"
+        content: |
+          # Managed by the provisioning backend
+          {% for key, value in bootstrap_sysctl | dictsort %}
+          {{ key }} = {{ value }}
+          {% endfor %}
+      when: bootstrap_sysctl | length > 0
+      register: bootstrap_sysctl_file
+
+    - name: Apply sysctl settings
+      ansible.builtin.command: sysctl --system
+      when: bootstrap_sysctl_file is changed
+      changed_when: true
+
+    - name: Raise open-file limits
+      ansible.builtin.copy:
+        dest: /etc/security/limits.d/90-provisioner.conf
+        mode: "0644"
+        content: |
+          # Managed by the provisioning backend
+          * soft nofile {{ bootstrap_nofile_limit }}
+          * hard nofile {{ bootstrap_nofile_limit }}
+          * soft nproc  {{ bootstrap_nofile_limit }}
+          * hard nproc  {{ bootstrap_nofile_limit }}
+      when: bootstrap_nofile_limit | int > 0
+
+    # -------------------------------------------------------------- SELinux
+    - name: Set the SELinux state
+      when:
+        - bootstrap_is_redhat
+        - bootstrap_selinux_state | length > 0
+      block:
+        - name: Persist the SELinux state
+          ansible.builtin.lineinfile:
+            path: /etc/selinux/config
+            regexp: '^SELINUX='
+            line: "SELINUX={{ bootstrap_selinux_state }}"
+          register: bootstrap_selinux_config
+
+        - name: Switch the running SELinux mode
+          ansible.builtin.command: "setenforce {{ '1' if bootstrap_selinux_state == 'enforcing' else '0' }}"
+          when:
+            - ansible_facts.selinux.status | default('disabled') == 'enabled'
+            - bootstrap_selinux_state != 'disabled'
+          changed_when: false
+          failed_when: false
+
+        - name: Note that disabling SELinux needs a reboot
+          ansible.builtin.debug:
+            msg: "SELinux state changed in /etc/selinux/config; a reboot is required for 'disabled' to take effect."
+          when:
+            - bootstrap_selinux_config is changed
+            - bootstrap_selinux_state == 'disabled'
+
+    # ------------------------------------------------------------- firewall
+    - name: Manage the host firewall
+      when: bootstrap_firewall_enabled is defined and bootstrap_firewall_enabled is not none
+      block:
+        - name: Enable or disable firewalld
+          ansible.builtin.systemd:
+            name: firewalld
+            state: "{{ 'started' if bootstrap_firewall_enabled | bool else 'stopped' }}"
+            enabled: "{{ bootstrap_firewall_enabled | bool }}"
+          when: bootstrap_is_redhat
+          failed_when: false
+
+        - name: Allow SSH before enabling ufw
+          ansible.builtin.command: "ufw allow {{ ansible_port | default(22) }}/tcp"
+          when:
+            - bootstrap_is_debian
+            - bootstrap_firewall_enabled | bool
+          changed_when: false
+          failed_when: false
+
+        - name: Enable or disable ufw
+          ansible.builtin.command: "ufw --force {{ 'enable' if bootstrap_firewall_enabled | bool else 'disable' }}"
+          when: bootstrap_is_debian
+          changed_when: false
+          failed_when: false
+
+    # ----------------------------------------------------------- admin user
+    - name: Admin user
+      when: bootstrap_admin_user | length > 0
+      block:
+        - name: Create the admin user
+          ansible.builtin.user:
+            name: "{{ bootstrap_admin_user }}"
+            shell: /bin/bash
+            groups: "{{ 'sudo' if bootstrap_is_debian else 'wheel' }}"
+            append: true
+
+        - name: Grant passwordless sudo to the admin user
+          ansible.builtin.copy:
+            dest: "/etc/sudoers.d/90-{{ bootstrap_admin_user }}"
+            content: "{{ bootstrap_admin_user }} ALL=(ALL) NOPASSWD:ALL\n"
+            mode: "0440"
+            validate: "visudo -cf %s"
+
+        - name: Create the admin .ssh directory
+          ansible.builtin.file:
+            path: "/home/{{ bootstrap_admin_user }}/.ssh"
+            state: directory
+            owner: "{{ bootstrap_admin_user }}"
+            group: "{{ bootstrap_admin_user }}"
+            mode: "0700"
+          when: bootstrap_admin_ssh_public_key | length > 0
+
+        # authorized_key lives in ansible.posix; lineinfile keeps this ansible-core only
+        - name: Install the admin SSH key
+          ansible.builtin.lineinfile:
+            path: "/home/{{ bootstrap_admin_user }}/.ssh/authorized_keys"
+            line: "{{ bootstrap_admin_ssh_public_key }}"
+            create: true
+            owner: "{{ bootstrap_admin_user }}"
+            group: "{{ bootstrap_admin_user }}"
+            mode: "0600"
+          when: bootstrap_admin_ssh_public_key | length > 0
+
+    # -------------------------------------------------------------- summary
+    - name: Record the bootstrap marker
+      ansible.builtin.copy:
+        dest: /etc/provisioner-bootstrap
+        mode: "0644"
+        content: |
+          cluster={{ provisioner_cluster_name | default('') }}
+          node_id={{ node_id | default('') }}
+          bootstrapped_at={{ ansible_facts.date_time.iso8601 }}

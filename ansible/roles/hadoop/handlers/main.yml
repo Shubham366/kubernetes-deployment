@@ -1,0 +1,38 @@
+---
+# =============================================================================
+# Handlers
+#
+# The role is driven through include_role from a multi-play playbook, and the
+# daemons must be (re)started in a strict cluster-wide order. Handlers
+# therefore never restart Hadoop daemons themselves: a configuration change
+# only *records* that fact, and the start stage of the playbook (a later play)
+# turns "started" into "restarted" for the affected hosts - see
+# hadoop_start_state / hadoop_zk_start_state in vars/main.yml.
+# Handlers run at the end of the preparing play, i.e. before any start play.
+# =============================================================================
+
+- name: hadoop config changed
+  ansible.builtin.set_fact:
+    hadoop_config_changed: true
+
+- name: hadoop zookeeper config changed
+  ansible.builtin.set_fact:
+    hadoop_zk_config_changed: true
+
+- name: hadoop systemd daemon-reload
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+# -e: ignore keys this kernel does not know (containers, old kernels) instead
+# of failing the whole install over a tuning parameter.
+- name: hadoop sysctl reload
+  ansible.builtin.command:
+    cmd: sysctl -e -p /etc/sysctl.d/90-hadoop.conf
+  changed_when: true
+  failed_when: false
+
+# --permanent rules only become active after a reload.
+- name: hadoop firewalld reload
+  ansible.builtin.command:
+    cmd: firewall-cmd --reload
+  changed_when: true

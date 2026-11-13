@@ -1,0 +1,126 @@
+---
+# =============================================================================
+# PostgreSQL role defaults
+#
+# The first block is the contract with the provisioning backend (extra vars).
+# The second block are optional tunables added by this role.
+# =============================================================================
+
+# ----------------------------------------------------------------------------
+# Contract variables
+# ----------------------------------------------------------------------------
+
+# install | start | stop | restart | status | uninstall | add_replica | promote
+postgresql_action: install
+
+# Major version from the PGDG repositories.
+postgresql_version: "16"
+
+# standalone | replication. Derived from the inventory when not passed.
+postgresql_mode: "{{ 'replication' if (groups.get('postgresql_replica', []) | length > 0) else 'standalone' }}"
+
+postgresql_port: 5432
+
+# Empty = OS default:
+#   Debian: /var/lib/postgresql/<ver>/main     EL: /var/lib/pgsql/<ver>/data
+postgresql_data_dir: ""
+
+postgresql_listen_addresses: "*"
+postgresql_max_connections: 200
+
+# "auto" = 25% of RAM. Otherwise any postgres memory value, e.g. "4GB".
+postgresql_shared_buffers: auto
+
+postgresql_replication_user: replicator
+postgresql_replication_password: ""
+
+# Optional password for the `postgres` superuser (local access stays peer).
+postgresql_superuser_password: ""
+
+# true: commits wait for at least one standby (synchronous_standby_names).
+postgresql_synchronous_replication: false
+
+# - { name: appdb, owner: app, encoding: UTF8 }
+postgresql_databases: []
+# - { name: app, password: secret, superuser: false, createdb: false }
+postgresql_users: []
+# Client networks allowed in pg_hba.conf, e.g. ["10.0.0.0/8"]
+postgresql_allowed_cidrs: []
+# - { name: pg_stat_statements, database: appdb }
+postgresql_extensions: []
+
+# add_replica: inventory hostnames (members of postgresql_replica) to build.
+postgresql_new_replicas: []
+
+# promote: inventory hostname of the replica that becomes the new primary.
+postgresql_promote_host: ""
+
+# uninstall: also delete the data directory and configuration.
+postgresql_purge_data: false
+
+# Free-form "parameter: value" pairs appended to postgresql.conf.
+postgresql_extra_config: {}
+
+# ----------------------------------------------------------------------------
+# Additional tunables (not part of the backend contract)
+# ----------------------------------------------------------------------------
+
+# --- repositories / packages ---
+postgresql_use_pgdg_repo: true
+postgresql_apt_repo_url: "https://apt.postgresql.org/pub/repos/apt"
+postgresql_apt_key_url: "https://www.postgresql.org/media/keys/ACCC4CF8.asc"
+postgresql_yum_repo_rpm_url: >-
+  https://download.postgresql.org/pub/repos/yum/reporpms/EL-{{ ansible_distribution_major_version }}-{{ ansible_architecture }}/pgdg-redhat-repo-latest.noarch.rpm
+# Extra OS packages, e.g. ["postgresql-16-postgis-3"] for non-contrib extensions.
+postgresql_extra_packages: []
+
+# --- cluster creation ---
+# Passed to initdb (Debian: after `pg_createcluster ... --`).
+postgresql_initdb_args: "--encoding=UTF8 --data-checksums"
+
+# --- authentication ---
+postgresql_auth_method: scram-sha-256
+# Extra networks allowed to connect for replication (besides the cluster nodes).
+postgresql_replication_allowed_cidrs: []
+
+# --- postgresql.conf ---
+postgresql_effective_cache_size: auto      # auto = 75% of RAM
+postgresql_maintenance_work_mem: auto      # auto = RAM/16, capped at 2GB
+postgresql_work_mem: "8MB"
+postgresql_wal_level: replica
+postgresql_max_wal_senders: 10
+postgresql_max_replication_slots: 10
+postgresql_wal_keep_size_mb: 1024
+postgresql_max_wal_size: "2GB"
+postgresql_min_wal_size: "256MB"
+postgresql_checkpoint_completion_target: 0.9
+postgresql_hot_standby_feedback: false
+postgresql_log_min_duration_statement: 1000
+postgresql_timezone: "UTC"
+
+# --- synchronous replication ---
+# synchronous_standby_names = '<method> <num> (standby, ...)'
+postgresql_synchronous_method: ANY         # ANY (quorum) | FIRST (priority)
+postgresql_synchronous_num: 1
+
+# --- replica build ---
+# Seconds pg_basebackup may run before the task gives up.
+postgresql_basebackup_timeout: 14400
+# A replica host whose data directory holds an initialised, non-standby
+# cluster is never wiped unless this is true (protects a promoted node whose
+# inventory entry is stale).
+postgresql_force_resync: false
+
+# --- promote ---
+# Stop the old primary first so two primaries can never accept writes.
+postgresql_promote_fence_old_primary: true
+# Re-point the remaining replicas at the promoted node.
+postgresql_promote_repoint_replicas: false
+postgresql_promote_timeout: 60
+
+# --- OS integration ---
+postgresql_manage_firewall: true
+postgresql_manage_selinux: true
+
+# --- uninstall ---
+postgresql_remove_repo: false

@@ -1,0 +1,23 @@
+---
+# scale_out in replication / sentinel mode: the new replica was installed with
+# `replicaof <master>` by the data-node play; here we only wait for the
+# initial sync to finish and report. Sentinels discover new replicas on their
+# own (through INFO on the master), nothing to register.
+
+- name: Verify replica | load variables
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Verify replica | wait for master_link_status:up
+  ansible.builtin.command: "{{ __redis_cli }} info replication"
+  environment: "{{ __redis_cli_env }}"
+  register: __redis_new_replica
+  changed_when: false
+  retries: "{{ redis_wait_retries | int }}"
+  delay: "{{ redis_wait_delay | int }}"
+  until:
+    - "'role:slave' in __redis_new_replica.stdout"
+    - "'master_link_status:up' in __redis_new_replica.stdout"
+
+- name: Verify replica | replication state
+  ansible.builtin.debug:
+    msg: "{{ __redis_new_replica.stdout_lines | select('match', '^(role|master_host|master_port|master_link_status|slave_repl_offset|master_sync_in_progress):') | list }}"

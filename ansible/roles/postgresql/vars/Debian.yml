@@ -1,0 +1,20 @@
+---
+# Debian / Ubuntu layout (postgresql-common "clusters"):
+#   config  /etc/postgresql/<ver>/main        data  /var/lib/postgresql/<ver>/main
+#   service postgresql@<ver>-main (instance of the postgresql@.service template;
+#           the umbrella postgresql.service is what gets enabled at boot)
+__pg_os_prereq_packages:
+  - ca-certificates
+  - gnupg
+  - curl
+  - locales
+  - postgresql-common
+__pg_os_packages:
+  - "postgresql-{{ __pg_version }}"
+  - "postgresql-client-{{ __pg_version }}"
+__pg_os_service: "postgresql@{{ __pg_version }}-main"
+__pg_os_enable_service: postgresql
+__pg_os_data_dir: "/var/lib/postgresql/{{ __pg_version }}/main"
+__pg_os_conf_dir: "/etc/postgresql/{{ __pg_version }}/main"
+__pg_os_bin_dir: "/usr/lib/postgresql/{{ __pg_version }}/bin"
+__pg_os_home: /var/lib/postgresql

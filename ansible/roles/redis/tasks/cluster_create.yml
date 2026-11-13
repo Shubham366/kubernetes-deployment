@@ -1,0 +1,103 @@
+---
+# One-off Redis Cluster bootstrap. The playbook runs this on a single host
+# (the "seed": first host of redis_cluster) after every node has been
+# installed with cluster-enabled yes. Nothing happens if the seed already
+# belongs to a formed cluster.
+
+- name: Cluster | load variables
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Cluster | enough nodes for {{ redis_cluster_replicas }} replica(s) per master
+  ansible.builtin.assert:
+    that:
+      - (__redis_cluster_group | length) >= (__redis_cluster_min_nodes | int)
+    fail_msg: >-
+      Redis Cluster with redis_cluster_replicas={{ redis_cluster_replicas }} needs at least
+      {{ __redis_cluster_min_nodes }} nodes (3 masters x {{ (redis_cluster_replicas | int) + 1 }}),
+      the redis_cluster group has {{ __redis_cluster_group | length }}.
+    quiet: true
+
+- name: Cluster | resolve node addresses
+  ansible.builtin.include_tasks: resolve_nodes.yml
+
+- name: Cluster | node endpoints
+  ansible.builtin.set_fact:
+    __redis_cluster_endpoints: >-
+      {{ __redis_cluster_group | map('extract', __redis_node_ips)
+         | map('regex_replace', '$', ':' ~ redis_port) | list }}
+
+# Every node must be reachable from the seed, on the data port and on the
+# cluster bus port, or `--cluster create` hangs at "Waiting for the cluster
+# to join".
+- name: Cluster | all nodes reachable from the seed (data port)
+  ansible.builtin.wait_for:
+    host: "{{ __redis_node_ips[item] }}"
+    port: "{{ redis_port | int }}"
+    timeout: 60
+  loop: "{{ __redis_cluster_group }}"
+
+- name: Cluster | all nodes reachable from the seed (bus port)
+  ansible.builtin.wait_for:
+    host: "{{ __redis_node_ips[item] }}"
+    port: "{{ (redis_port | int) + 10000 }}"
+    timeout: 60
+  loop: "{{ __redis_cluster_group }}"
+
+- name: Cluster | current cluster state on the seed
+  ansible.builtin.command: "{{ __redis_cli }} cluster info"
+  environment: "{{ __redis_cli_env }}"
+  register: __redis_cluster_info
+  changed_when: false
+
+# A freshly started cluster-enabled node knows only itself
+# (cluster_known_nodes:1) and has no slots. More than one known node means it
+# was already joined, by an earlier run or by hand: never run create again.
+- name: Cluster | is the cluster already formed
+  ansible.builtin.set_fact:
+    __redis_cluster_known_nodes: "{{ __redis_cluster_info.stdout | regex_findall('cluster_known_nodes:([0-9]+)') | first | default('0') | int }}"
+    __redis_cluster_formed: >-
+      {{ (__redis_cluster_info.stdout | regex_findall('cluster_known_nodes:([0-9]+)') | first | default('0') | int) > 1 }}
+
+- name: Cluster | already formed, skipping create
+  ansible.builtin.debug:
+    msg: >-
+      Seed {{ inventory_hostname }} already knows {{ __redis_cluster_known_nodes }} nodes
+      ({{ __redis_cluster_info.stdout | regex_search('cluster_state:\w+') }}); not running --cluster create.
+  when: __redis_cluster_formed | bool
+
+- name: Cluster | create
+  when: not (__redis_cluster_formed | bool)
+  block:
+    - name: Cluster | redis-cli --cluster create
+      ansible.builtin.command: >-
+        {{ __redis_cli_bin }} --cluster create {{ __redis_cluster_endpoints | join(' ') }}
+        --cluster-replicas {{ redis_cluster_replicas | int }} --cluster-yes
+      environment: "{{ __redis_cli_env }}"
+      register: __redis_cluster_create
+      changed_when: true
+
+    - name: Cluster | create output
+      ansible.builtin.debug:
+        msg: "{{ __redis_cluster_create.stdout_lines }}"
+
+- name: Cluster | wait for cluster_state:ok
+  ansible.builtin.command: "{{ __redis_cli }} cluster info"
+  environment: "{{ __redis_cli_env }}"
+  register: __redis_cluster_wait
+  changed_when: false
+  retries: "{{ redis_wait_retries | int }}"
+  delay: "{{ redis_wait_delay | int }}"
+  until:
+    - "'cluster_state:ok' in __redis_cluster_wait.stdout"
+    - "'cluster_slots_assigned:16384' in __redis_cluster_wait.stdout"
+
+- name: Cluster | consistency check
+  ansible.builtin.command: "{{ __redis_cli_bin }} --cluster check {{ __redis_node_ips[inventory_hostname] }}:{{ redis_port }}"
+  environment: "{{ __redis_cli_env }}"
+  register: __redis_cluster_check
+  changed_when: false
+  failed_when: false
+
+- name: Cluster | topology
+  ansible.builtin.debug:
+    msg: "{{ __redis_cluster_check.stdout_lines }}"

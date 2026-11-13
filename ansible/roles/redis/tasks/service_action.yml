@@ -1,0 +1,64 @@
+---
+# redis_action = start | stop
+# Acts on whichever redis units belong to this host: the data node unit, the
+# sentinel unit, or both when they are co-located.
+
+- name: Service | load variables
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Service | desired state
+  ansible.builtin.set_fact:
+    __redis_desired_state: "{{ 'started' if redis_action == 'start' else 'stopped' }}"
+
+# Stop order: sentinel first, so it does not react to the data node going
+# away. Start order: data node first, so the sentinel finds it up.
+- name: Service | stop sentinel
+  ansible.builtin.systemd:
+    name: "{{ __redis_sentinel_service }}"
+    state: stopped
+  when:
+    - redis_action == 'stop'
+    - __redis_is_sentinel | bool
+    - redis_mode == 'sentinel'
+
+- name: Service | {{ redis_action }} data node
+  ansible.builtin.systemd:
+    name: "{{ __redis_service }}"
+    state: "{{ __redis_desired_state }}"
+  when: __redis_is_data_node | bool
+
+- name: Service | wait for the data port
+  ansible.builtin.wait_for:
+    host: "{{ __redis_cli_host }}"
+    port: "{{ redis_port | int }}"
+    state: "{{ 'started' if redis_action == 'start' else 'stopped' }}"
+    timeout: 120
+  when: __redis_is_data_node | bool
+
+- name: Service | wait for PING after start
+  ansible.builtin.command: "{{ __redis_cli }} ping"
+  environment: "{{ __redis_cli_env }}"
+  register: __redis_start_ping
+  changed_when: false
+  retries: "{{ redis_wait_retries | int }}"
+  delay: "{{ redis_wait_delay | int }}"
+  until: "'PONG' in __redis_start_ping.stdout"
+  when:
+    - redis_action == 'start'
+    - __redis_is_data_node | bool
+
+- name: Service | start sentinel
+  ansible.builtin.systemd:
+    name: "{{ __redis_sentinel_service }}"
+    state: started
+  when:
+    - redis_action == 'start'
+    - __redis_is_sentinel | bool
+    - redis_mode == 'sentinel'
+
+- name: Service | result
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: redis_action={{ redis_action }} done
+      ({{ (__redis_service if __redis_is_data_node | bool else '') }}
+      {{ (__redis_sentinel_service if (__redis_is_sentinel | bool and redis_mode == 'sentinel') else '') }})

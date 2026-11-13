@@ -1,0 +1,68 @@
+---
+# SELinux (RedHat family). postgres runs confined as postgresql_t and may only
+#   * bind ports labelled postgresql_port_t (5432 by default)
+#   * use data files labelled postgresql_db_t (/var/lib/pgsql by default)
+# so a custom port or data directory needs extra labels. Best effort: nothing
+# in here aborts the install, problems show up as warnings.
+
+- name: SELinux | current mode
+  ansible.builtin.command: getenforce
+  register: __pg_getenforce
+  changed_when: false
+  failed_when: false
+
+- name: SELinux | labels
+  when:
+    - __pg_getenforce.rc | default(1) == 0
+    - (__pg_getenforce.stdout | default('Disabled') | trim) != 'Disabled'
+  block:
+    - name: SELinux | semanage tooling
+      ansible.builtin.package:
+        name: "{{ 'policycoreutils-python' if (ansible_distribution_major_version | int <= 7) else 'policycoreutils-python-utils' }}"
+        state: present
+      failed_when: false
+
+    # ---- port ----
+    - name: SELinux | ports labelled postgresql_port_t
+      ansible.builtin.shell: "semanage port -l | grep -E '^postgresql_port_t\\s+tcp' || true"
+      register: __pg_semanage_ports
+      changed_when: false
+      failed_when: false
+
+    # -a fails when the port already carries another label; -m relabels it.
+    - name: SELinux | label port {{ postgresql_port }} as postgresql_port_t
+      ansible.builtin.shell: >-
+        semanage port -a -t postgresql_port_t -p tcp {{ postgresql_port | int }}
+        || semanage port -m -t postgresql_port_t -p tcp {{ postgresql_port | int }}
+      register: __pg_semanage_port_add
+      changed_when: __pg_semanage_port_add.rc == 0
+      failed_when: false
+      when: (postgresql_port | string) not in (__pg_semanage_ports.stdout | default('') | regex_findall('[0-9]+'))
+
+    # ---- custom data directory ----
+    - name: SELinux | file context for the custom data directory
+      ansible.builtin.shell: >-
+        semanage fcontext -a -t postgresql_db_t '{{ __pg_data_dir }}(/.*)?'
+        || semanage fcontext -m -t postgresql_db_t '{{ __pg_data_dir }}(/.*)?'
+      register: __pg_semanage_fcontext
+      changed_when: false
+      failed_when: false
+      when: __pg_custom_data_dir | bool
+
+    - name: SELinux | restorecon on the data directory
+      ansible.builtin.command: "restorecon -R {{ __pg_data_dir }}"
+      register: __pg_restorecon
+      changed_when: false
+      failed_when: false
+      when: __pg_custom_data_dir | bool
+
+    - name: SELinux | warn about labelling problems
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: SELinux labelling did not fully succeed
+          (port rc={{ __pg_semanage_port_add.rc | default('skipped') }},
+          fcontext rc={{ __pg_semanage_fcontext.rc | default('skipped') }}).
+          PostgreSQL may fail to start with a custom port/data directory while SELinux is enforcing.
+      when: >-
+        (__pg_semanage_port_add.rc | default(0)) != 0
+        or (__pg_semanage_fcontext.rc | default(0)) != 0

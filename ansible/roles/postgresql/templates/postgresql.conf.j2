@@ -1,0 +1,124 @@
+# {{ ansible_managed }}
+#
+# PostgreSQL {{ __pg_version }} on {{ inventory_hostname }} ({{ __pg_self_addr }})
+# Role in inventory: {{ 'primary' if __pg_is_primary | bool else 'replica' }} ({{ postgresql_mode }})
+#
+# Settings changed with ALTER SYSTEM (postgresql.auto.conf) override this
+# file. The role itself uses that for:
+#   * synchronous_standby_names   (tasks/sync.yml)
+#   * primary_conninfo / primary_slot_name on standbys (pg_basebackup -R)
+{# Render a value in postgresql.conf syntax: booleans -> on/off, numbers bare,
+   everything else single-quoted with embedded quotes doubled. #}
+{% macro pgval(v) -%}
+{% if v is sameas true %}on{% elif v is sameas false %}off{% elif v is number %}{{ v }}{% else %}'{{ v | string | replace("'", "''") }}'{% endif %}
+{%- endmacro %}
+
+#------------------------------------------------------------------------------
+# FILE LOCATIONS
+#------------------------------------------------------------------------------
+{% if ansible_os_family == 'Debian' %}
+# Debian layout: configuration in /etc, data elsewhere.
+data_directory = '{{ __pg_data_dir }}'
+hba_file = '{{ __pg_hba_file }}'
+ident_file = '{{ __pg_conf_dir }}/pg_ident.conf'
+external_pid_file = '/var/run/postgresql/{{ __pg_version }}-main.pid'
+{% else %}
+# RedHat layout: configuration lives in the data directory ({{ __pg_data_dir }}).
+{% endif %}
+
+#------------------------------------------------------------------------------
+# CONNECTIONS AND AUTHENTICATION
+#------------------------------------------------------------------------------
+listen_addresses = '{{ postgresql_listen_addresses }}'
+port = {{ postgresql_port }}
+max_connections = {{ postgresql_max_connections }}
+unix_socket_directories = '{{ __pg_socket_dir }}'
+{% if postgresql_auth_method in ['scram-sha-256', 'md5'] %}
+password_encryption = {{ postgresql_auth_method }}
+{% endif %}
+
+#------------------------------------------------------------------------------
+# RESOURCE USAGE
+#------------------------------------------------------------------------------
+# postgresql_shared_buffers={{ postgresql_shared_buffers }} (host has {{ __pg_mem_mb }} MB RAM)
+shared_buffers = {{ __pg_shared_buffers | trim }}
+effective_cache_size = {{ __pg_effective_cache_size | trim }}
+work_mem = {{ postgresql_work_mem }}
+maintenance_work_mem = {{ __pg_maintenance_work_mem | trim }}
+dynamic_shared_memory_type = posix
+
+#------------------------------------------------------------------------------
+# WRITE-AHEAD LOG
+#------------------------------------------------------------------------------
+wal_level = {{ postgresql_wal_level }}
+# Needed for pg_rewind when an old primary is re-attached after a failover
+# (harmless when data checksums are enabled).
+wal_log_hints = on
+max_wal_size = {{ postgresql_max_wal_size }}
+min_wal_size = {{ postgresql_min_wal_size }}
+checkpoint_completion_target = {{ postgresql_checkpoint_completion_target }}
+
+#------------------------------------------------------------------------------
+# REPLICATION
+#------------------------------------------------------------------------------
+# The same settings are rendered on every node so that any standby can take
+# over as primary (promote) without a configuration change.
+max_wal_senders = {{ postgresql_max_wal_senders }}
+max_replication_slots = {{ postgresql_max_replication_slots }}
+{% if __pg_version | int >= 13 %}
+wal_keep_size = {{ postgresql_wal_keep_size_mb }}MB
+{% else %}
+wal_keep_segments = {{ (postgresql_wal_keep_size_mb | int) // 16 }}
+{% endif %}
+hot_standby = on
+hot_standby_feedback = {{ 'on' if postgresql_hot_standby_feedback | bool else 'off' }}
+# synchronous_standby_names is managed with ALTER SYSTEM (see header).
+
+#------------------------------------------------------------------------------
+# REPORTING AND LOGGING
+#------------------------------------------------------------------------------
+# cluster_name is also what a standby reports as application_name, i.e. the
+# name synchronous_standby_names on the primary refers to.
+cluster_name = '{{ __pg_node_name }}'
+{% if ansible_os_family == 'RedHat' %}
+logging_collector = on
+log_destination = 'stderr'
+log_directory = 'log'
+log_filename = 'postgresql-%a.log'
+log_truncate_on_rotation = on
+log_rotation_age = 1d
+log_rotation_size = 0
+{% else %}
+# Debian: stderr is captured by pg_ctlcluster into
+# /var/log/postgresql/postgresql-{{ __pg_version }}-main.log (rotated by logrotate).
+{% endif %}
+log_line_prefix = '%m [%p] %q%u@%d '
+log_timezone = '{{ postgresql_timezone }}'
+log_checkpoints = on
+log_connections = off
+log_disconnections = off
+log_lock_waits = on
+log_min_duration_statement = {{ postgresql_log_min_duration_statement }}
+
+#------------------------------------------------------------------------------
+# CLIENT CONNECTION DEFAULTS
+#------------------------------------------------------------------------------
+timezone = '{{ postgresql_timezone }}'
+datestyle = 'iso, mdy'
+default_text_search_config = 'pg_catalog.english'
+
+{% if ansible_os_family == 'Debian' %}
+#------------------------------------------------------------------------------
+# INCLUDES
+#------------------------------------------------------------------------------
+include_dir = 'conf.d'
+
+{% endif %}
+{% if postgresql_extra_config | length > 0 %}
+#------------------------------------------------------------------------------
+# EXTRA (postgresql_extra_config) - last occurrence of a parameter wins
+#------------------------------------------------------------------------------
+{% for key, value in postgresql_extra_config | dictsort %}
+{{ key }} = {{ pgval(value) }}
+{% endfor %}
+{% endif %}

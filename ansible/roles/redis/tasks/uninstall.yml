@@ -1,0 +1,151 @@
+---
+# redis_action = uninstall
+# Removes services, units, binaries/packages and OS tuning. Data, config and
+# logs are only deleted with redis_purge_data=true. Safe to run on a host
+# where redis is only partially installed or already gone.
+#
+# NOTE: cluster nodes are simply removed; they are not gracefully taken out of
+# a running cluster first (no slot migration / `--cluster del-node`).
+
+- name: Uninstall | load variables
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Uninstall | stop and disable services
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: false
+  loop:
+    - "{{ __redis_sentinel_service }}"
+    - "{{ __redis_service }}"
+  register: __redis_un_stop
+  # a unit that was never installed is not an error here
+  failed_when:
+    - __redis_un_stop is failed
+    - "'Could not find' not in (__redis_un_stop.msg | default(''))"
+    - "'not found' not in (__redis_un_stop.msg | default(''))"
+    - "'does not exist' not in (__redis_un_stop.msg | default(''))"
+
+- name: Uninstall | remove unit files
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ __redis_unit_file }}"
+    - "{{ __redis_sentinel_unit_file }}"
+  register: __redis_un_units
+
+- name: Uninstall | close firewall ports
+  ansible.builtin.include_tasks: firewall.yml
+  vars:
+    __redis_fw_state: closed
+  when: redis_manage_firewall | bool
+
+# --------------------------- source installation -----------------------------
+- name: Uninstall | source-built binaries
+  ansible.builtin.file:
+    path: "{{ redis_source_prefix }}/bin/{{ item }}"
+    state: absent
+  loop:
+    - redis-server
+    - redis-cli
+    - redis-sentinel
+    - redis-benchmark
+    - redis-check-aof
+    - redis-check-rdb
+
+- name: Uninstall | find leftover source tarballs / build trees
+  ansible.builtin.find:
+    paths: "{{ redis_source_dir }}"
+    patterns: "redis-*"
+    file_type: any
+  register: __redis_un_src
+
+- name: Uninstall | remove source tarballs / build trees
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ __redis_un_src.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+# --------------------------- package installation ----------------------------
+# Only when the caller says the package method was used: we must not remove a
+# distro redis that somebody else installed next to a source build.
+- name: Uninstall | packages
+  when: redis_install_method == 'package'
+  block:
+    - name: Uninstall | unmask distro units
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        masked: false
+      loop: "{{ __redis_os_distro_services }}"
+      failed_when: false
+
+    - name: Uninstall | apt remove
+      ansible.builtin.apt:
+        name: "{{ __redis_os_packages + __redis_os_sentinel_packages }}"
+        state: absent
+        purge: "{{ redis_purge_data | bool }}"
+        autoremove: true
+      when: ansible_os_family == 'Debian'
+
+    - name: Uninstall | yum/dnf remove
+      ansible.builtin.package:
+        name: "{{ __redis_os_packages }}"
+        state: absent
+      when: ansible_os_family == 'RedHat'
+
+# ------------------------------- OS tuning -----------------------------------
+- name: Uninstall | disable THP unit
+  ansible.builtin.systemd:
+    name: "{{ __redis_thp_service }}"
+    state: stopped
+    enabled: false
+  failed_when: false
+  when: redis_manage_kernel | bool
+
+- name: Uninstall | remove kernel tuning files
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "/etc/systemd/system/{{ __redis_thp_service }}.service"
+    - "{{ __redis_sysctl_file }}"
+  when: redis_manage_kernel | bool
+
+- name: Uninstall | logrotate config
+  ansible.builtin.file:
+    path: /etc/logrotate.d/redis-ansible
+    state: absent
+
+- name: Uninstall | reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+# --------------------------------- data --------------------------------------
+- name: Uninstall | purge data, configuration and logs
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ redis_data_dir }}"
+    - "{{ redis_conf_dir }}"
+    - "{{ redis_log_dir }}"
+  when: redis_purge_data | bool
+
+# The account is only removed together with the data it owns.
+- name: Uninstall | remove service account
+  ansible.builtin.user:
+    name: "{{ redis_user }}"
+    state: absent
+  when:
+    - redis_purge_data | bool
+    - redis_user != 'root'
+
+- name: Uninstall | result
+  ansible.builtin.debug:
+    msg: >-
+      redis removed from {{ inventory_hostname }}.
+      {{ 'Data, configuration and logs were deleted.' if redis_purge_data | bool
+         else 'Data (' ~ redis_data_dir ~ '), configuration (' ~ redis_conf_dir ~ ') and logs were kept; pass redis_purge_data=true to delete them.' }}

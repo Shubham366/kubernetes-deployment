@@ -1,0 +1,62 @@
+---
+# =============================================================================
+# hadoop role - default entry point
+#
+# The cluster-wide orchestration (who starts before whom, rolling restarts,
+# format -> bootstrapStandby ordering, decommission waits ...) lives in
+# playbooks/software/hadoop.yml, which calls the individual task files of this
+# role with include_role/tasks_from, one play per stage.
+#
+# This file only covers the *node-local* part of each action so that the role
+# is still usable on its own (e.g. `roles: [hadoop]` on a single box):
+#
+#   install / scale_out -> prepare.yml  (OS, Java, user, binaries, config, units)
+#   start / stop / restart -> services.yml for every daemon this host runs
+#   status              -> status.yml
+#   uninstall           -> stop + uninstall.yml
+#   decommission        -> needs the playbook (multi-host workflow)
+# =============================================================================
+
+- name: Main | Validate the request
+  ansible.builtin.include_tasks: validate.yml
+
+- name: Main | Preflight checks
+  ansible.builtin.include_tasks: preflight.yml
+  when: hadoop_action in ['install', 'scale_out']
+
+- name: Main | Prepare the node (install / scale_out)
+  ansible.builtin.include_tasks: prepare.yml
+  when: hadoop_action in ['install', 'scale_out']
+
+- name: Main | Install ZooKeeper
+  ansible.builtin.include_tasks: zookeeper.yml
+  when:
+    - hadoop_action == 'install'
+    - inventory_hostname in hadoop_zk_hosts
+
+- name: Main | Start / restart every daemon of this host
+  ansible.builtin.include_tasks: services.yml
+  vars:
+    hadoop_svc_daemons: "{{ hadoop_daemon_order }}"
+    hadoop_svc_state: "{{ 'restarted' if hadoop_action == 'restart' else 'started' }}"
+  when: hadoop_action in ['start', 'restart']
+
+- name: Main | Stop every daemon of this host
+  ansible.builtin.include_tasks: stop_all.yml
+  when: hadoop_action in ['stop', 'uninstall']
+
+- name: Main | Uninstall
+  ansible.builtin.include_tasks: uninstall.yml
+  when: hadoop_action == 'uninstall'
+
+- name: Main | Node status
+  ansible.builtin.include_tasks: status.yml
+  when: hadoop_action == 'status'
+
+- name: Main | Decommission needs the orchestration playbook
+  ansible.builtin.fail:
+    msg: >-
+      hadoop_action=decommission is a multi-host workflow (exclude files ->
+      refreshNodes on the NameNode -> wait -> stop). Run
+      playbooks/software/hadoop.yml instead of applying the role directly.
+  when: hadoop_action == 'decommission'

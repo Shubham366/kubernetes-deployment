@@ -1,0 +1,212 @@
+---
+# =============================================================================
+# Operating system prerequisites
+#
+#   packages (Debian / RedHat) - time sync - sysctl - ulimits - swap - THP -
+#   SELinux - tmpfiles
+#
+# Only ansible.builtin modules are used: sysctl goes through a drop-in file +
+# `sysctl -p`, SELinux through /etc/selinux/config + setenforce.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Packages
+# ---------------------------------------------------------------------------
+- name: OS | Refresh the apt cache (Debian family)
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+  when: ansible_os_family == 'Debian'
+  register: hadoop_apt_update
+  retries: 3
+  delay: 10
+  until: hadoop_apt_update is succeeded
+
+- name: OS | Install base packages (Debian family)
+  ansible.builtin.apt:
+    name: "{{ hadoop_os_packages['Debian'] }}"
+    state: present
+    install_recommends: false
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+  when: ansible_os_family == 'Debian'
+  register: hadoop_pkg_install_deb
+  retries: 3
+  delay: 10
+  until: hadoop_pkg_install_deb is succeeded
+
+# ansible.builtin.package picks yum on EL7 and dnf on EL8/9.
+- name: OS | Install base packages (RedHat family)
+  ansible.builtin.package:
+    name: "{{ hadoop_os_packages['RedHat'] }}"
+    state: present
+  when: ansible_os_family == 'RedHat'
+  register: hadoop_pkg_install_rh
+  retries: 3
+  delay: 10
+  until: hadoop_pkg_install_rh is succeeded
+
+# ---------------------------------------------------------------------------
+# Time synchronisation - HDFS HA, Kerberos-less token expiry and YARN all
+# misbehave with clock skew. Best effort: do not fail the install over it.
+# ---------------------------------------------------------------------------
+- name: OS | Time synchronisation (chrony)
+  when: hadoop_install_chrony | bool
+  block:
+    - name: OS | Install chrony
+      ansible.builtin.package:
+        name: chrony
+        state: present
+
+    - name: OS | Enable and start chrony
+      ansible.builtin.systemd:
+        name: "{{ hadoop_chrony_service[ansible_os_family] }}"
+        enabled: true
+        state: started
+  rescue:
+    - name: OS | chrony could not be set up
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: chrony could not be installed/started on {{ inventory_hostname }}
+          (another NTP client may be active). Make sure the clocks of all nodes
+          are synchronised.
+
+# ---------------------------------------------------------------------------
+# Kernel parameters
+# ---------------------------------------------------------------------------
+- name: OS | Kernel parameters drop-in
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/90-hadoop.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by ansible (hadoop role) - do not edit.
+      {% for key, value in hadoop_sysctl_settings | dictsort %}
+      {{ key }} = {{ value }}
+      {% endfor %}
+  notify: hadoop sysctl reload
+  when: hadoop_manage_sysctl | bool
+
+# ---------------------------------------------------------------------------
+# ulimits (login sessions; the systemd units carry their own Limit* settings)
+# ---------------------------------------------------------------------------
+- name: OS | ulimits for the Hadoop and ZooKeeper users
+  ansible.builtin.copy:
+    dest: /etc/security/limits.d/90-hadoop.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by ansible (hadoop role) - do not edit.
+      {% for u in [hadoop_user, hadoop_zookeeper_user] | unique %}
+      {{ u }} soft nofile {{ hadoop_nofile_limit }}
+      {{ u }} hard nofile {{ hadoop_nofile_limit }}
+      {{ u }} soft nproc  {{ hadoop_nproc_limit }}
+      {{ u }} hard nproc  {{ hadoop_nproc_limit }}
+      {% endfor %}
+
+# ---------------------------------------------------------------------------
+# Swap
+# ---------------------------------------------------------------------------
+- name: OS | Turn swap off
+  ansible.builtin.command:
+    cmd: swapoff -a
+  when:
+    - hadoop_disable_swap | bool
+    - (ansible_swaptotal_mb | default(0) | int) > 0
+  changed_when: true
+
+- name: OS | Keep swap off across reboots (comment out fstab entries)
+  ansible.builtin.replace:
+    path: /etc/fstab
+    regexp: '^([^#\n][^\n]*\sswap\s[^\n]*)$'
+    replace: '# \1'
+    backup: true
+  when: hadoop_disable_swap | bool
+
+# ---------------------------------------------------------------------------
+# Transparent Huge Pages
+# ---------------------------------------------------------------------------
+- name: OS | Unit that disables Transparent Huge Pages at boot
+  ansible.builtin.template:
+    src: disable-thp.service.j2
+    dest: /etc/systemd/system/hadoop-disable-thp.service
+    owner: root
+    group: root
+    mode: "0644"
+  when: hadoop_disable_thp | bool
+  register: hadoop_thp_unit
+
+- name: OS | Disable Transparent Huge Pages now and on boot
+  ansible.builtin.systemd:
+    name: hadoop-disable-thp.service
+    daemon_reload: "{{ hadoop_thp_unit is changed }}"
+    enabled: true
+    state: "{{ 'restarted' if hadoop_thp_unit is changed else 'started' }}"
+  when: hadoop_disable_thp | bool
+
+# ---------------------------------------------------------------------------
+# SELinux (RedHat family)
+# ---------------------------------------------------------------------------
+- name: OS | Read the current SELinux mode
+  ansible.builtin.command:
+    cmd: getenforce
+  register: hadoop_getenforce
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: ansible_os_family == 'RedHat'
+
+- name: OS | Report SELinux mode
+  ansible.builtin.debug:
+    msg: >-
+      SELinux on {{ inventory_hostname }}: {{ hadoop_getenforce.stdout | default('n/a') }}
+      (requested: {{ hadoop_selinux_state }}). With 'keep', the daemons run
+      unconfined under the targeted policy and file contexts are restored on
+      the install tree.
+  when:
+    - ansible_os_family == 'RedHat'
+    - hadoop_getenforce.rc | default(1) == 0
+
+- name: OS | Persist the requested SELinux mode
+  ansible.builtin.lineinfile:
+    path: /etc/selinux/config
+    regexp: '^SELINUX='
+    line: "SELINUX={{ hadoop_selinux_state }}"
+  when:
+    - ansible_os_family == 'RedHat'
+    - hadoop_selinux_state in ['permissive', 'disabled', 'enforcing']
+    - hadoop_getenforce.rc | default(1) == 0
+
+# "disabled" only takes effect after a reboot; go permissive until then.
+- name: OS | Switch SELinux to permissive at runtime
+  ansible.builtin.command:
+    cmd: setenforce 0
+  when:
+    - ansible_os_family == 'RedHat'
+    - hadoop_selinux_state in ['permissive', 'disabled']
+    - hadoop_getenforce.stdout | default('') == 'Enforcing'
+  changed_when: true
+
+- name: OS | Switch SELinux to enforcing at runtime
+  ansible.builtin.command:
+    cmd: setenforce 1
+  when:
+    - ansible_os_family == 'RedHat'
+    - hadoop_selinux_state == 'enforcing'
+    - hadoop_getenforce.stdout | default('') == 'Permissive'
+  changed_when: true
+
+# ---------------------------------------------------------------------------
+# /run/hadoop must survive reboots (/run is a tmpfs)
+# ---------------------------------------------------------------------------
+- name: OS | tmpfiles.d entry for the PID directory
+  ansible.builtin.copy:
+    dest: /etc/tmpfiles.d/hadoop.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by ansible (hadoop role)
+      d {{ hadoop_pid_dir }} 0755 {{ hadoop_user }} {{ hadoop_group }} -

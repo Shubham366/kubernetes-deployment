@@ -1,0 +1,18 @@
+{
+  "name": "analytics",
+  "description": "Mixed-OS cluster: Ubuntu, CentOS and RHEL nodes",
+  "environment": "staging",
+  "defaults": {"ssh_user": "provision", "ssh_key_path": "~/.ssh/id_ed25519", "become": true},
+  "nodes": [
+    {"hostname": "an-master-01", "address": "10.20.0.11", "os_type": "ubuntu", "os_version": "22.04", "labels": {"rack": "r1"}},
+    {"hostname": "an-master-02", "address": "10.20.0.12", "os_type": "ubuntu", "os_version": "22.04", "labels": {"rack": "r2"}},
+    {"hostname": "an-master-03", "address": "10.20.0.13", "os_type": "rhel",   "os_version": "9.4",   "labels": {"rack": "r3"}},
+    {"hostname": "an-worker-01", "address": "10.20.0.21", "os_type": "ubuntu", "os_version": "24.04", "labels": {"rack": "r1"}},
+    {"hostname": "an-worker-02", "address": "10.20.0.22", "os_type": "centos", "os_version": "9",     "labels": {"rack": "r2"}},
+    {"hostname": "an-worker-03", "address": "10.20.0.23", "os_type": "rhel",   "os_version": "8.10",  "labels": {"rack": "r3"}},
+    {"hostname": "an-worker-04", "address": "10.20.0.24", "os_type": "centos", "os_version": "7.9",   "labels": {"rack": "r1"}},
+    {"hostname": "an-db-01",     "address": "10.20.0.31", "os_type": "rhel",   "os_version": "9.4"},
+    {"hostname": "an-db-02",     "address": "10.20.0.32", "os_type": "ubuntu", "os_version": "22.04"},
+    {"hostname": "an-db-03",     "address": "10.20.0.33", "os_type": "ubuntu", "os_version": "22.04"}
+  ]
+}

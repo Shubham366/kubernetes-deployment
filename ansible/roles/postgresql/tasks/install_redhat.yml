@@ -1,0 +1,63 @@
+---
+# RHEL / CentOS / Rocky / Alma: PGDG yum repository + postgresql<ver>-server.
+
+- name: RedHat | prerequisites
+  ansible.builtin.package:
+    name: "{{ __pg_os_prereq_packages }}"
+    state: present
+
+# The repo RPM is not signed with a key the system already trusts (it is the
+# package that delivers the PGDG keys), hence disable_gpg_check for this one
+# RPM only. Packages from the repository itself are GPG checked.
+- name: RedHat | PGDG repository RPM (EL7)
+  ansible.builtin.yum:
+    name: "{{ postgresql_yum_repo_rpm_url }}"
+    state: present
+    disable_gpg_check: true
+  register: __pg_repo_rpm7
+  retries: 3
+  delay: 10
+  until: __pg_repo_rpm7 is succeeded
+  when: ansible_distribution_major_version | int <= 7
+
+- name: RedHat | PGDG repository RPM (EL8+)
+  ansible.builtin.dnf:
+    name: "{{ postgresql_yum_repo_rpm_url }}"
+    state: present
+    disable_gpg_check: true
+  register: __pg_repo_rpm
+  retries: 3
+  delay: 10
+  until: __pg_repo_rpm is succeeded
+  when: ansible_distribution_major_version | int >= 8
+
+# EL8+ ship PostgreSQL as an AppStream module whose packages shadow the PGDG
+# ones (same names are filtered by modularity), so `dnf install
+# postgresql16-server` finds nothing until the module is disabled.
+- name: RedHat | is the built-in postgresql module already disabled
+  ansible.builtin.shell: "dnf -q module list --disabled postgresql 2>/dev/null | grep -c '^postgresql' || true"
+  register: __pg_module_disabled
+  changed_when: false
+  when: ansible_distribution_major_version | int >= 8
+
+- name: RedHat | disable the built-in postgresql module
+  ansible.builtin.command: dnf -qy module disable postgresql
+  register: __pg_module_disable
+  changed_when: true
+  # EL10+ may not have the module at all
+  failed_when:
+    - __pg_module_disable.rc != 0
+    - "'No such module' not in (__pg_module_disable.stderr | default(''))"
+    - "'Unable to resolve argument' not in (__pg_module_disable.stderr | default(''))"
+  when:
+    - ansible_distribution_major_version | int >= 8
+    - (__pg_module_disabled.stdout | default('0') | trim | int) == 0
+
+- name: RedHat | install PostgreSQL {{ __pg_version }}
+  ansible.builtin.package:
+    name: "{{ __pg_os_packages }}"
+    state: present
+  register: __pg_yum_install
+  retries: 3
+  delay: 10
+  until: __pg_yum_install is succeeded

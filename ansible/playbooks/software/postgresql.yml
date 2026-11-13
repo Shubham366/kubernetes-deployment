@@ -1,0 +1,214 @@
+---
+# =============================================================================
+# PostgreSQL provisioning playbook
+#
+#   ansible-playbook -i <inventory> playbooks/software/postgresql.yml \
+#       -e postgresql_action=install -e postgresql_version=16 \
+#       -e postgresql_replication_password=...
+#
+# Inventory groups (the replica group may be missing):
+#   postgresql_primary   exactly one host
+#   postgresql_replica   zero or more streaming replicas
+#
+# postgresql_action:
+#   install | start | stop | restart | status | uninstall | add_replica | promote
+#
+# Play order matters: the primary must be up (with the replication role and
+# slots) before the replicas take their base backup, and synchronous
+# replication is only switched on once the standbys are streaming.
+#
+# Facts: every play has gather_facts: false; the role gathers them itself
+# (tasks/setup_vars.yml) the first time it really runs on a host. Plays that
+# are skipped for the current action never connect to their hosts, which is
+# what lets `promote` succeed while the old primary is unreachable.
+#
+# NOTE: role defaults are not visible to the `when:` of an include_role task,
+# so the values the playbook itself branches on are normalised into `_pg_*`
+# play vars (shared between the plays through a YAML anchor).
+# =============================================================================
+
+- name: PostgreSQL | Preflight checks
+  hosts: "postgresql_primary:postgresql_replica:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  vars: &pg_play_vars
+    _pg_action: "{{ postgresql_action | default('install') }}"
+    _pg_mode: >-
+      {{ postgresql_mode | default('replication' if (groups.get('postgresql_replica', []) | length > 0) else 'standalone') }}
+    _pg_new_replicas: >-
+      {{ (postgresql_new_replicas.split(',') | map('trim') | select | list)
+         if (postgresql_new_replicas | default([])) is string else (postgresql_new_replicas | default([], true)) }}
+    _pg_promote_host: "{{ postgresql_promote_host | default('') }}"
+    _pg_fence: "{{ postgresql_promote_fence_old_primary | default(true) | bool }}"
+    _pg_repoint: "{{ postgresql_promote_repoint_replicas | default(false) | bool }}"
+  tasks:
+    - name: Run postgresql preflight assertions
+      ansible.builtin.include_role:
+        name: postgresql
+        tasks_from: preflight
+
+# -----------------------------------------------------------------------------
+# install / add_replica
+# -----------------------------------------------------------------------------
+
+- name: PostgreSQL | Install and configure the primary
+  hosts: "postgresql_primary:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  vars: *pg_play_vars
+  tasks:
+    - name: Install primary
+      ansible.builtin.include_role:
+        name: postgresql
+        tasks_from: primary
+      when: _pg_action == 'install'
+
+# Replicas prepare the primary themselves (replication role, slot, pg_hba
+# entry) through delegated tasks, so add_replica also works when the backend
+# limits the run to the new hosts with target_hosts.
+- name: PostgreSQL | Install and configure replicas
+  hosts: "postgresql_replica:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  vars: *pg_play_vars
+  tasks:
+    - name: Install replica
+      ansible.builtin.include_role:
+        name: postgresql
+        tasks_from: replica
+      when: >-
+        (_pg_action == 'install' and _pg_mode == 'replication')
+        or (_pg_action == 'add_replica' and inventory_hostname in _pg_new_replicas)
+
+- name: PostgreSQL | Synchronous replication settings
+  hosts: "postgresql_primary:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  vars: *pg_play_vars
+  tasks:
+    - name: Apply synchronous_standby_names on the primary
+      ansible.builtin.include_role:
+        name: postgresql
+        tasks_from: sync
+      when: _pg_action in ['install', 'add_replica']
+
+# -----------------------------------------------------------------------------
+# start / stop / restart
+#   start  : primary first, then replicas
+#   stop   : primary first (replicas receive the shutdown checkpoint), then replicas
+#   restart: replicas one by one, primary last
+# -----------------------------------------------------------------------------
+
+- name: PostgreSQL | Start or stop the primary
+  hosts: "postgresql_primary:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  vars: *pg_play_vars
+  tasks:
+    - name: Start / stop primary
+      ansible.builtin.include_role:
+        name: postgresql
+        tasks_from: service_action
+      when: _pg_action in ['start', 'stop']
+
+- name: PostgreSQL | Start, stop or restart replicas
+  hosts: "postgresql_replica:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  serial: 1
+  vars: *pg_play_vars
+  tasks:
+    - name: Start / stop / restart replica
+      ansible.builtin.include_role:
+        name: postgresql
+        tasks_from: service_action
+      when: _pg_action in ['start', 'stop', 'restart']
+
+- name: PostgreSQL | Restart the primary
+  hosts: "postgresql_primary:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  vars: *pg_play_vars
+  tasks:
+    - name: Restart primary
+      ansible.builtin.include_role:
+        name: postgresql
+        tasks_from: service_action
+      when: _pg_action == 'restart'
+
+# -----------------------------------------------------------------------------
+# promote
+#   1. fence (stop) the old primary        - optional, on by default
+#   2. promote postgresql_promote_host
+#   3. re-point the other replicas          - optional, off by default
+# The inventory is NOT changed by this playbook: after a promote the backend
+# has to move the hosts between postgresql_primary / postgresql_replica.
+# -----------------------------------------------------------------------------
+
+- name: PostgreSQL | Promote - fence the old primary
+  hosts: "postgresql_primary:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  # A dead primary is the usual reason for a promote: do not fail the run
+  # when it cannot be reached.
+  ignore_unreachable: true
+  vars: *pg_play_vars
+  tasks:
+    - name: Stop the old primary
+      ansible.builtin.include_role:
+        name: postgresql
+        tasks_from: fence
+      when:
+        - _pg_action == 'promote'
+        - _pg_fence | bool
+        - inventory_hostname != _pg_promote_host
+
+- name: PostgreSQL | Promote - promote the chosen replica
+  hosts: "postgresql_replica:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  vars: *pg_play_vars
+  tasks:
+    - name: Promote replica to primary
+      ansible.builtin.include_role:
+        name: postgresql
+        tasks_from: promote
+      when:
+        - _pg_action == 'promote'
+        - inventory_hostname == _pg_promote_host
+
+- name: PostgreSQL | Promote - re-point remaining replicas
+  hosts: "postgresql_replica:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  serial: 1
+  vars: *pg_play_vars
+  tasks:
+    - name: Follow the new primary
+      ansible.builtin.include_role:
+        name: postgresql
+        tasks_from: repoint
+      when:
+        - _pg_action == 'promote'
+        - _pg_repoint | bool
+        - inventory_hostname != _pg_promote_host
+
+# -----------------------------------------------------------------------------
+# status
+# -----------------------------------------------------------------------------
+
+- name: PostgreSQL | Status
+  hosts: "postgresql_primary:postgresql_replica:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  vars: *pg_play_vars
+  tasks:
+    - name: Collect and print postgresql status
+      ansible.builtin.include_role:
+        name: postgresql
+        tasks_from: status
+      when: _pg_action == 'status'
+
+# -----------------------------------------------------------------------------
+# uninstall
+# -----------------------------------------------------------------------------
+
+- name: PostgreSQL | Uninstall
+  hosts: "postgresql_primary:postgresql_replica:&{{ target_hosts | default('all') }}"
+  gather_facts: false
+  vars: *pg_play_vars
+  tasks:
+    - name: Remove postgresql
+      ansible.builtin.include_role:
+        name: postgresql
+        tasks_from: uninstall
+      when: _pg_action == 'uninstall'

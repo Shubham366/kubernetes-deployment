@@ -1,0 +1,112 @@
+---
+# redis.conf + systemd unit for a data node, then make sure it is running.
+
+- name: Configure | existing config file
+  ansible.builtin.stat:
+    path: "{{ __redis_conf_file }}"
+  register: __redis_conf_stat
+
+# In sentinel mode the topology is owned by sentinel after the first install:
+# on failover it rewrites `replicaof` in redis.conf (CONFIG REWRITE). Blindly
+# re-rendering from the inventory would undo a failover, so:
+#   * an existing config is left alone unless redis_force_reconfigure=true
+#   * when forced, the node keeps the replicaof line it currently has
+- name: Configure | read current replicaof (sentinel mode)
+  ansible.builtin.command: "grep -E '^(replicaof|slaveof) ' {{ __redis_conf_file }}"
+  register: __redis_current_replicaof
+  changed_when: false
+  failed_when: false
+  when:
+    - redis_mode == 'sentinel'
+    - __redis_conf_stat.stat.exists
+
+- name: Configure | decide how to render the config
+  ansible.builtin.set_fact:
+    __redis_sentinel_managed: "{{ redis_mode == 'sentinel' and __redis_conf_stat.stat.exists }}"
+    __redis_preserved_replicaof: >-
+      {{ (__redis_current_replicaof.stdout_lines | default([]) | last | default(''))
+         if (redis_mode == 'sentinel' and __redis_conf_stat.stat.exists) else '' }}
+
+- name: Configure | note that an existing sentinel-managed config is kept
+  ansible.builtin.debug:
+    msg: >-
+      {{ __redis_conf_file }} already exists and redis_mode=sentinel: leaving it untouched
+      (sentinel owns it). Pass redis_force_reconfigure=true to re-render it.
+  when:
+    - __redis_sentinel_managed | bool
+    - not (redis_force_reconfigure | bool)
+
+- name: Configure | render redis.conf
+  ansible.builtin.template:
+    src: redis.conf.j2
+    dest: "{{ __redis_conf_file }}"
+    owner: "{{ redis_user }}"
+    group: "{{ redis_group }}"
+    mode: "0640"
+  # the file contains requirepass/masterauth: never print a diff of it
+  diff: false
+  notify: Restart redis
+  when: not (__redis_sentinel_managed | bool) or (redis_force_reconfigure | bool)
+
+- name: Configure | systemd unit
+  ansible.builtin.template:
+    src: redis.service.j2
+    dest: "{{ __redis_unit_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd for redis
+    - Restart redis
+
+# see install_source.yml: restart once after the binaries were upgraded
+- name: Configure | schedule restart after binary upgrade
+  ansible.builtin.debug:
+    msg: "redis binaries changed, {{ __redis_service }} will be restarted"
+  changed_when: true
+  notify: Restart redis
+  when: __redis_binary_changed_data | default(false) | bool
+
+- name: Configure | binary upgrade handled
+  ansible.builtin.set_fact:
+    __redis_binary_changed_data: false
+
+# Apply config/unit changes now (a "restart" of a stopped unit starts it), so
+# the checks below run against the final configuration.
+- name: Configure | apply pending restarts
+  ansible.builtin.meta: flush_handlers
+
+- name: Configure | enable and start redis
+  ansible.builtin.systemd:
+    name: "{{ __redis_service }}"
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Configure | wait for the port
+  ansible.builtin.wait_for:
+    host: "{{ __redis_cli_host }}"
+    port: "{{ redis_port | int }}"
+    timeout: 120
+
+# PING answers LOADING while a big dataset is read from disk; keep trying.
+- name: Configure | wait for redis to answer PING
+  ansible.builtin.command: "{{ __redis_cli }} ping"
+  environment: "{{ __redis_cli_env }}"
+  register: __redis_ping
+  changed_when: false
+  retries: "{{ redis_wait_retries | int }}"
+  delay: "{{ redis_wait_delay | int }}"
+  until: "'PONG' in __redis_ping.stdout"
+
+- name: Configure | replication state
+  ansible.builtin.command: "{{ __redis_cli }} info replication"
+  environment: "{{ __redis_cli_env }}"
+  register: __redis_repl_info
+  changed_when: false
+  when: redis_mode in ['replication', 'sentinel']
+
+- name: Configure | show replication state
+  ansible.builtin.debug:
+    msg: "{{ __redis_repl_info.stdout_lines | select('match', '^(role|master_host|master_port|master_link_status|connected_slaves|slave[0-9]+):') | list }}"
+  when: __redis_repl_info is not skipped

@@ -1,0 +1,38 @@
+{#
+  core-site.xml
+  Properties are collected in a dict so that hadoop_extra_core_site can
+  override or extend any of them; the XML is rendered from the merged result.
+#}
+{% set props = {
+  'fs.defaultFS': hadoop_default_fs,
+  'hadoop.tmp.dir': hadoop_tmp_dir,
+  'io.file.buffer.size': 131072,
+  'fs.trash.interval': hadoop_fs_trash_interval_minutes,
+  'hadoop.http.staticuser.user': hadoop_user,
+  'ipc.client.connect.max.retries': 30,
+  'ipc.client.connect.retry.interval': 1000
+} %}
+{# ZooKeeper quorum: ZKFC (NameNode HA) and the YARN RM election / state store #}
+{% if hadoop_ha | bool %}
+{%   set _ = props.update({
+  'ha.zookeeper.quorum': hadoop_zk_quorum,
+  'ha.zookeeper.parent-znode': hadoop_ha_zk_parent_znode,
+  'ha.zookeeper.session-timeout.ms': 10000
+}) %}
+{% endif %}
+{% if hadoop_zk_hosts | length > 0 %}
+{%   set _ = props.update({'hadoop.zk.address': hadoop_zk_quorum}) %}
+{% endif %}
+{% set _ = props.update(hadoop_extra_core_site | default({}, true)) %}
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<!-- {{ ansible_managed }} -->
+<!-- Generated for {{ inventory_hostname }} - cluster {{ hadoop_cluster_name }}. Local edits are overwritten. -->
+<configuration>
+{% for name, value in props | dictsort %}
+  <property>
+    <name>{{ name }}</name>
+    <value>{{ (value | string | lower) if value is boolean else (value | string | e) }}</value>
+  </property>
+{% endfor %}
+</configuration>

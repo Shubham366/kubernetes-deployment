@@ -1,0 +1,37 @@
+---
+# Loads OS specific variables and works out where the redis binaries live.
+# Included at the top of every entry-point task file; cheap and idempotent.
+
+# The playbook's plays do not gather facts (see the note at its top).
+- name: Vars | gather facts
+  ansible.builtin.setup:
+  when: ansible_os_family is not defined
+
+- name: Vars | supported OS family
+  ansible.builtin.assert:
+    that:
+      - ansible_os_family in ['Debian', 'RedHat']
+    fail_msg: >-
+      Unsupported OS family '{{ ansible_os_family }}' on {{ inventory_hostname }}
+      (declared_os={{ declared_os | default('n/a') }}). Supported: Debian/Ubuntu and RHEL/CentOS/Rocky/Alma.
+    quiet: true
+
+- name: Vars | load OS family variables
+  ansible.builtin.include_vars:
+    file: "{{ ansible_os_family }}.yml"
+
+- name: Vars | look for a source-built redis
+  ansible.builtin.stat:
+    path: "{{ redis_source_prefix }}/bin/redis-server"
+  register: __redis_source_bin
+
+# install/scale_out: the requested install method decides.
+# every other action: use whatever is actually on the box, so that the backend
+# does not have to remember (and re-send) redis_install_method.
+- name: Vars | decide binary directory
+  ansible.builtin.set_fact:
+    redis_bin_dir: >-
+      {{ (redis_source_prefix ~ '/bin')
+         if ((redis_action in ['install', 'scale_out'] and redis_install_method == 'source')
+             or (redis_action not in ['install', 'scale_out'] and __redis_source_bin.stat.exists))
+         else '/usr/bin' }}

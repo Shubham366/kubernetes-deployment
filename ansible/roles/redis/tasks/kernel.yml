@@ -1,0 +1,63 @@
+---
+# Kernel settings Redis complains about at startup:
+#   vm.overcommit_memory=1  -> background saves (fork) do not fail under memory pressure
+#   net.core.somaxconn      -> must be >= tcp-backlog
+#   THP disabled            -> avoids latency spikes / memory bloat after fork
+#
+# No ansible.posix.sysctl here (builtin modules only): we drop a file in
+# /etc/sysctl.d and load it with `sysctl -p` whenever it changes.
+
+- name: Kernel | sysctl drop-in for redis
+  ansible.builtin.copy:
+    dest: "{{ __redis_sysctl_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible (redis role)
+      vm.overcommit_memory = 1
+      net.core.somaxconn = {{ redis_somaxconn }}
+      net.ipv4.tcp_max_syn_backlog = {{ redis_somaxconn }}
+  register: __redis_sysctl
+
+# Fails harmlessly inside containers where /proc/sys is read-only.
+- name: Kernel | apply sysctl settings
+  ansible.builtin.command: "sysctl -p {{ __redis_sysctl_file }}"
+  register: __redis_sysctl_apply
+  changed_when: __redis_sysctl_apply.rc == 0
+  failed_when: false
+  when: __redis_sysctl is changed
+
+- name: Kernel | report sysctl problems
+  ansible.builtin.debug:
+    msg: "WARNING: could not apply sysctl settings: {{ __redis_sysctl_apply.stderr | default('') }}"
+  when:
+    - __redis_sysctl_apply is not skipped
+    - __redis_sysctl_apply.rc | default(0) != 0
+
+- name: Kernel | is transparent hugepage support present
+  ansible.builtin.stat:
+    path: /sys/kernel/mm/transparent_hugepage/enabled
+  register: __redis_thp
+
+# A oneshot unit (rather than rc.local / grub edits) keeps THP off across
+# reboots on every supported distro and is trivially removable on uninstall.
+- name: Kernel | THP
+  when: __redis_thp.stat.exists
+  block:
+    - name: Kernel | install disable-THP unit
+      ansible.builtin.template:
+        src: disable-thp.service.j2
+        dest: "/etc/systemd/system/{{ __redis_thp_service }}.service"
+        owner: root
+        group: root
+        mode: "0644"
+      register: __redis_thp_unit
+
+    - name: Kernel | enable and run disable-THP unit
+      ansible.builtin.systemd:
+        name: "{{ __redis_thp_service }}"
+        enabled: true
+        state: "{{ 'restarted' if __redis_thp_unit is changed else 'started' }}"
+        daemon_reload: "{{ __redis_thp_unit is changed }}"
+      failed_when: false

@@ -1,0 +1,8 @@
+{# Initial content of dfs.exclude / yarn.exclude. The files are created once
+   (force: false) and from then on only appended to by the decommission
+   action, so they start out empty unless a decommission is in flight. #}
+{% if hadoop_action == 'decommission' %}
+{% for entry in hadoop_decom_entries %}
+{{ entry }}
+{% endfor %}
+{% endif %}

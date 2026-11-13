@@ -1,0 +1,104 @@
+---
+# postgresql_action = uninstall
+# Stops the server and removes the packages. The data directory and the
+# configuration are only deleted with postgresql_purge_data=true. Safe to run
+# on a host where PostgreSQL is partially installed or already gone.
+#
+# NOTE: a replica's replication slot on the primary is NOT dropped here.
+# When a single replica is uninstalled for good, drop its slot on the primary
+# (SELECT pg_drop_replication_slot('replica_<host>')) or WAL accumulates there.
+
+- name: Uninstall | load variables
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Uninstall | stop the server
+  ansible.builtin.systemd:
+    name: "{{ __pg_service }}"
+    state: stopped
+  register: __pg_un_stop
+  failed_when:
+    - __pg_un_stop is failed
+    - "'Could not find' not in (__pg_un_stop.msg | default(''))"
+    - "'not found' not in (__pg_un_stop.msg | default(''))"
+    - "'does not exist' not in (__pg_un_stop.msg | default(''))"
+
+- name: Uninstall | disable start at boot
+  ansible.builtin.systemd:
+    name: "{{ __pg_os_enable_service }}"
+    enabled: false
+  failed_when: false
+
+- name: Uninstall | close the firewall port
+  ansible.builtin.include_tasks: firewall.yml
+  vars:
+    __pg_fw_state: closed
+  when: postgresql_manage_firewall | bool
+
+# ------------------------------- Debian ---------------------------------------
+- name: Uninstall | Debian
+  when: ansible_os_family == 'Debian'
+  block:
+    # pg_dropcluster removes the data directory AND /etc/postgresql/<ver>/main,
+    # and unregisters the cluster; only when the data is to be purged.
+    - name: Uninstall | drop the cluster (purge)
+      ansible.builtin.command: "pg_dropcluster --stop {{ __pg_version }} main"
+      args:
+        removes: "{{ __pg_conf_file }}"
+      register: __pg_un_drop
+      failed_when: false
+      when: postgresql_purge_data | bool
+
+    - name: Uninstall | apt remove
+      ansible.builtin.apt:
+        name: "{{ __pg_os_packages + postgresql_extra_packages }}"
+        state: absent
+        purge: "{{ postgresql_purge_data | bool }}"
+        autoremove: true
+
+    - name: Uninstall | PGDG apt source
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/pgdg.list
+        - /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+      when: postgresql_remove_repo | bool
+
+# ------------------------------- RedHat ---------------------------------------
+- name: Uninstall | RedHat
+  when: ansible_os_family == 'RedHat'
+  block:
+    - name: Uninstall | yum/dnf remove
+      ansible.builtin.package:
+        name: "{{ __pg_os_packages + postgresql_extra_packages }}"
+        state: absent
+
+    - name: Uninstall | systemd drop-in
+      ansible.builtin.file:
+        path: "/etc/systemd/system/{{ __pg_service }}.service.d"
+        state: absent
+
+    - name: Uninstall | PGDG repository package
+      ansible.builtin.package:
+        name: pgdg-redhat-repo
+        state: absent
+      when: postgresql_remove_repo | bool
+
+- name: Uninstall | reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+# -------------------------------- data ----------------------------------------
+- name: Uninstall | purge data and configuration
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: "{{ [__pg_data_dir, __pg_conf_dir, __pg_pgpass_file, __pg_basebackup_marker] | unique }}"
+  when: postgresql_purge_data | bool
+
+- name: Uninstall | result
+  ansible.builtin.debug:
+    msg: >-
+      PostgreSQL {{ __pg_version }} removed from {{ inventory_hostname }}.
+      {{ 'Data and configuration were deleted.' if postgresql_purge_data | bool
+         else 'Data directory ' ~ __pg_data_dir ~ ' was kept; pass postgresql_purge_data=true to delete it.' }}

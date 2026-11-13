@@ -1,0 +1,273 @@
+---
+# Installs or removes a specific CPython version next to the system Python.
+# The system interpreter (/usr/bin/python3) is never replaced: package
+# managers depend on it.
+#
+# Extra vars:
+#   python_version         full version, e.g. 3.11.9          (required)
+#   python_state           present | absent                    (default present)
+#   python_install_method  package | source                    (default source)
+#   python_set_default     symlink /usr/local/bin/python3 and pip3 to it (default false)
+#   python_enable_optimizations  PGO/LTO build, much slower    (default false)
+#   python_source_url      override the download URL
+#   python_install_root    default /opt/python
+- name: Manage the Python runtime
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: true
+  become: true
+  vars:
+    python_state: present
+    python_install_method: source
+    python_set_default: false
+    python_enable_optimizations: false
+    python_install_root: /opt/python
+    python_minor: "{{ (python_version | string).split('.')[:2] | join('.') }}"
+    python_prefix: "{{ python_install_root }}/{{ python_version }}"
+    python_is_debian: "{{ ansible_facts.os_family == 'Debian' }}"
+    python_el_major: "{{ ansible_facts.distribution_major_version | int }}"
+    python_default_url: "https://www.python.org/ftp/python/{{ python_version }}/Python-{{ python_version }}.tgz"
+    # EL8 names older streams python38/python39, newer ones python3.11
+    python_rpm_base: >-
+      {{ 'python' ~ python_minor | replace('.', '') if (python_el_major | int == 8 and python_minor in ['3.8', '3.9'])
+         else ('python3' if (python_el_major | int == 9 and python_minor == '3.9') else 'python' ~ python_minor) }}
+    python_packages: >-
+      {{ ['python' ~ python_minor, 'python' ~ python_minor ~ '-venv', 'python' ~ python_minor ~ '-dev'] if python_is_debian
+         else [python_rpm_base, python_rpm_base ~ '-pip', python_rpm_base ~ '-devel'] }}
+    python_binary: >-
+      {{ python_prefix ~ '/bin/python' ~ python_minor if python_install_method == 'source'
+         else '/usr/bin/python' ~ python_minor }}
+    python_build_deps_debian:
+      - build-essential
+      - libssl-dev
+      - zlib1g-dev
+      - libbz2-dev
+      - libreadline-dev
+      - libsqlite3-dev
+      - libffi-dev
+      - liblzma-dev
+      - libncursesw5-dev
+      - libgdbm-dev
+      - uuid-dev
+      - tk-dev
+      - wget
+      - xz-utils
+    python_build_deps_redhat:
+      - gcc
+      - make
+      - zlib-devel
+      - bzip2-devel
+      - readline-devel
+      - sqlite-devel
+      - libffi-devel
+      - xz-devel
+      - ncurses-devel
+      - gdbm-devel
+      - libuuid-devel
+      - wget
+      - tar
+  tasks:
+    - name: Validate input
+      ansible.builtin.assert:
+        that:
+          - python_version is defined
+          - (python_version | string) is match('^3\.[0-9]+(\.[0-9]+)?$')
+          - python_state in ['present', 'absent']
+          - python_install_method in ['package', 'source']
+        fail_msg: "python_version must look like 3.11.9; python_state present|absent; method package|source"
+
+    - name: A source build needs a full x.y.z version
+      ansible.builtin.assert:
+        that: (python_version | string) is match('^3\.[0-9]+\.[0-9]+$')
+        fail_msg: "python_install_method=source needs a full version such as 3.11.9"
+      when:
+        - python_state == 'present'
+        - python_install_method == 'source'
+
+    # -------------------------------------------------------------- package
+    - name: Install from distribution packages
+      when:
+        - python_state == 'present'
+        - python_install_method == 'package'
+      block:
+        - name: Refresh the apt cache
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: 3600
+          when: python_is_debian
+
+        - name: Install the Python packages
+          ansible.builtin.package:
+            name: "{{ python_packages }}"
+            state: present
+
+    # --------------------------------------------------------------- source
+    - name: Build from source
+      when:
+        - python_state == 'present'
+        - python_install_method == 'source'
+      block:
+        - name: Check for an existing build
+          ansible.builtin.stat:
+            path: "{{ python_binary }}"
+          register: python_existing
+
+        - name: Refresh the apt cache
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: 3600
+          when: python_is_debian and not python_existing.stat.exists
+
+        - name: Install build dependencies (Debian family)
+          ansible.builtin.apt:
+            name: "{{ python_build_deps_debian }}"
+            state: present
+          when: python_is_debian and not python_existing.stat.exists
+
+        - name: Install build dependencies (RedHat family)
+          ansible.builtin.package:
+            name: "{{ python_build_deps_redhat + (['openssl-devel'] if python_el_major | int >= 8 else []) }}"
+            state: present
+          when: not python_is_debian and not python_existing.stat.exists
+
+        # EL7 ships OpenSSL 1.0.2; Python >= 3.10 requires 1.1.1 (openssl11 from EPEL)
+        - name: Install OpenSSL 1.1 for EL7
+          ansible.builtin.package:
+            name: [epel-release, openssl11, openssl11-devel]
+            state: present
+          when:
+            - not python_is_debian
+            - python_el_major | int == 7
+            - not python_existing.stat.exists
+
+        - name: Check free space for the build
+          ansible.builtin.shell: "df -Pm /tmp | awk 'NR==2 {print $4}'"
+          register: python_tmp_free
+          changed_when: false
+          when: not python_existing.stat.exists
+
+        - name: Require 1 GiB free in /tmp
+          ansible.builtin.assert:
+            that: python_tmp_free.stdout | int > 1024
+            fail_msg: "Not enough space in /tmp to build Python ({{ python_tmp_free.stdout }} MiB free)"
+          when: not python_existing.stat.exists
+
+        - name: Download the source
+          ansible.builtin.get_url:
+            url: "{{ python_source_url | default(python_default_url) }}"
+            dest: "/tmp/Python-{{ python_version }}.tgz"
+            mode: "0644"
+            timeout: 120
+          register: python_download
+          retries: 3
+          delay: 15
+          until: python_download is succeeded
+          when: not python_existing.stat.exists
+
+        - name: Unpack the source
+          ansible.builtin.unarchive:
+            src: "/tmp/Python-{{ python_version }}.tgz"
+            dest: /tmp
+            remote_src: true
+          when: not python_existing.stat.exists
+
+        - name: Configure the build
+          ansible.builtin.shell: |
+            set -e
+            {% if not python_is_debian and python_el_major | int == 7 %}
+            export CFLAGS="$(pkg-config --cflags openssl11)"
+            export LDFLAGS="$(pkg-config --libs openssl11)"
+            {% endif %}
+            ./configure --prefix={{ python_prefix | quote }} --with-ensurepip=install \
+              {{ '--enable-optimizations --with-lto' if python_enable_optimizations | bool else '' }}
+          args:
+            chdir: "/tmp/Python-{{ python_version }}"
+          when: not python_existing.stat.exists
+          changed_when: true
+
+        - name: Compile and install (altinstall never overwrites python3)
+          ansible.builtin.shell: "make -j{{ ansible_facts.processor_vcpus | default(2) }} && make altinstall"
+          args:
+            chdir: "/tmp/Python-{{ python_version }}"
+            creates: "{{ python_binary }}"
+          async: 3600
+          poll: 15
+
+        - name: Clean up the build tree
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - "/tmp/Python-{{ python_version }}"
+            - "/tmp/Python-{{ python_version }}.tgz"
+
+        - name: Expose the versioned interpreter in /usr/local/bin
+          ansible.builtin.file:
+            src: "{{ python_prefix }}/bin/{{ item }}{{ python_minor }}"
+            dest: "/usr/local/bin/{{ item }}{{ python_minor }}"
+            state: link
+            force: true
+          loop: [python, pip]
+
+    - name: Verify the interpreter
+      ansible.builtin.command: "{{ python_binary }} -c 'import ssl, sqlite3, sys; print(sys.version.split()[0])'"
+      register: python_verify
+      changed_when: false
+      when: python_state == 'present'
+
+    - name: Show the installed version
+      ansible.builtin.debug:
+        msg: "Python {{ python_verify.stdout }} available at {{ python_binary }}"
+      when: python_state == 'present'
+
+    - name: Point /usr/local/bin/python3 and pip3 at this version
+      ansible.builtin.file:
+        src: "{{ item.src }}"
+        dest: "/usr/local/bin/{{ item.name }}"
+        state: link
+        force: true
+      loop:
+        - {name: python3, src: "{{ python_binary }}"}
+        - {name: pip3, src: "{{ python_binary | dirname }}/pip{{ python_minor }}"}
+      when:
+        - python_state == 'present'
+        - python_set_default | bool
+      failed_when: false
+
+    # -------------------------------------------------------------- removal
+    - name: Remove Python
+      when: python_state == 'absent'
+      block:
+        - name: Refuse to remove the interpreter Ansible and the OS depend on
+          ansible.builtin.assert:
+            that: python_minor != (ansible_facts.python.version.major ~ '.' ~ ansible_facts.python.version.minor)
+                  or python_install_method == 'source'
+            fail_msg: >-
+              Python {{ python_minor }} is the system interpreter on {{ inventory_hostname }};
+              removing its packages would break the package manager.
+
+        - name: Find /usr/local/bin links into the removed prefix
+          ansible.builtin.shell: |
+            for link in /usr/local/bin/python{{ python_minor }} /usr/local/bin/pip{{ python_minor }} \
+                        /usr/local/bin/python3 /usr/local/bin/pip3; do
+              if [ -L "$link" ] && readlink "$link" | grep -q "^{{ python_install_root }}/{{ python_minor }}"; then
+                rm -f "$link" && echo "removed $link"
+              fi
+            done
+          register: python_links
+          changed_when: "'removed' in python_links.stdout"
+
+        - name: Remove source installations of this minor version
+          ansible.builtin.shell: |
+            removed=0
+            for dir in {{ python_install_root | quote }}/{{ python_minor }}.*; do
+              [ -d "$dir" ] && rm -rf "$dir" && removed=1
+            done
+            [ "$removed" = 1 ] && echo removed || true
+          register: python_dirs
+          changed_when: "'removed' in python_dirs.stdout"
+
+        - name: Remove the distribution packages
+          ansible.builtin.package:
+            name: "{{ python_packages }}"
+            state: absent
+          when: python_minor != (ansible_facts.python.version.major ~ '.' ~ ansible_facts.python.version.minor)

@@ -1,0 +1,53 @@
+---
+# Entry point when the role is used directly (`roles: [redis]`).
+#
+# playbooks/software/redis.yml does NOT come through here: it calls the task
+# files below one by one with `tasks_from`, because the multi-node scenarios
+# need a specific play order (data nodes -> sentinels -> cluster bootstrap,
+# rolling restarts with serial: 1, ...). This dispatcher covers the per-host
+# part of each action so the role is still usable on its own.
+
+- name: Validate topology and variables
+  ansible.builtin.include_tasks: preflight.yml
+
+- name: Install / configure data node
+  ansible.builtin.include_tasks: data_node.yml
+  when:
+    - redis_action in ['install', 'scale_out']
+    - inventory_hostname in (groups.get('redis_master', []) + groups.get('redis_replica', []) + groups.get('redis_cluster', []))
+    - redis_action == 'install' or inventory_hostname in redis_new_nodes
+
+- name: Install / configure sentinel
+  ansible.builtin.include_tasks: sentinel.yml
+  when:
+    - redis_action in ['install', 'scale_out']
+    - redis_mode == 'sentinel'
+    - inventory_hostname in groups.get('redis_sentinel', [])
+    - redis_action == 'install' or inventory_hostname in redis_new_nodes
+
+- name: Start / stop services
+  ansible.builtin.include_tasks: service_action.yml
+  when: redis_action in ['start', 'stop']
+
+- name: Restart data node
+  ansible.builtin.include_tasks: restart.yml
+  vars:
+    redis_restart_pass: masters
+  when:
+    - redis_action == 'restart'
+    - inventory_hostname in (groups.get('redis_master', []) + groups.get('redis_replica', []) + groups.get('redis_cluster', []))
+
+- name: Restart sentinel
+  ansible.builtin.include_tasks: restart_sentinel.yml
+  when:
+    - redis_action == 'restart'
+    - redis_mode == 'sentinel'
+    - inventory_hostname in groups.get('redis_sentinel', [])
+
+- name: Status
+  ansible.builtin.include_tasks: status.yml
+  when: redis_action == 'status'
+
+- name: Uninstall
+  ansible.builtin.include_tasks: uninstall.yml
+  when: redis_action == 'uninstall'

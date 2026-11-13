@@ -1,0 +1,162 @@
+---
+# =============================================================================
+# Request validation - cheap, no changes, runs for every action.
+# Catches bad extra vars / inventory before anything touches the hosts.
+# =============================================================================
+
+- name: Validate | hadoop_action is supported
+  ansible.builtin.assert:
+    that:
+      - hadoop_action in ['install', 'start', 'stop', 'restart', 'status', 'uninstall', 'scale_out', 'decommission']
+    fail_msg: >-
+      Unsupported hadoop_action '{{ hadoop_action }}'. Expected one of: install,
+      start, stop, restart, status, uninstall, scale_out, decommission.
+    quiet: true
+  run_once: true
+
+- name: Validate | Version and cluster name
+  ansible.builtin.assert:
+    that:
+      - hadoop_version is string
+      - hadoop_version is match('^[0-9]+\.[0-9]+\.[0-9]+')
+      - hadoop_version is version('3.0.0', '>=')
+      - hadoop_cluster_name is string
+      - hadoop_cluster_name is match('^[A-Za-z][A-Za-z0-9-]*$')
+      - (hadoop_java_version | int) in [8, 11, 17, 21]
+    fail_msg: >-
+      Invalid basic settings. hadoop_version must be 3.x ("{{ hadoop_version }}"),
+      hadoop_cluster_name may only contain letters, digits and dashes
+      ("{{ hadoop_cluster_name }}" - it is used as the HDFS nameservice id, so
+      underscores and dots are not allowed), hadoop_java_version must be
+      8, 11, 17 or 21 ("{{ hadoop_java_version }}").
+    quiet: true
+  run_once: true
+
+- name: Validate | Hadoop 3.3.x and older do not run on Java 21
+  ansible.builtin.assert:
+    that:
+      - (hadoop_java_version | int) < 21 or hadoop_version is version('3.4.0', '>=')
+    fail_msg: "Java {{ hadoop_java_version }} needs Hadoop >= 3.4.0 (requested {{ hadoop_version }})."
+    quiet: true
+  run_once: true
+
+- name: Validate | The inventory declares a NameNode
+  ansible.builtin.assert:
+    that:
+      - hadoop_nn_hosts | length >= 1
+    fail_msg: >-
+      Inventory group 'hadoop_namenode' is empty or missing. Every action needs
+      to know where the NameNode lives.
+    quiet: true
+  run_once: true
+
+- name: Validate | This host belongs to the Hadoop cluster
+  ansible.builtin.assert:
+    that:
+      - inventory_hostname in hadoop_all_hosts
+    fail_msg: >-
+      {{ inventory_hostname }} is not a member of any hadoop_* inventory group.
+    quiet: true
+
+- name: Validate | Directory settings are absolute paths
+  ansible.builtin.assert:
+    that:
+      - hadoop_dn_dirs | length >= 1
+      - hadoop_nn_dirs | length >= 1
+      - (hadoop_dn_dirs + hadoop_nn_dirs + hadoop_checkpoint_dirs + hadoop_yarn_local_dirs + hadoop_yarn_log_dirs
+         + [hadoop_journal_dir, hadoop_tmp_dir, hadoop_install_dir, hadoop_conf_dir, hadoop_log_dir])
+        | reject('match', '^/[^/ ]+') | list | length == 0
+    fail_msg: >-
+      hadoop_data_dirs / hadoop_name_dirs must be non-empty lists and every
+      Hadoop directory must be an absolute path below / (no spaces).
+    quiet: true
+  run_once: true
+
+- name: Validate | Replication factor
+  ansible.builtin.assert:
+    that:
+      - (hadoop_replication_factor | int) >= 1
+      - (hadoop_replication_factor | int) <= 512
+    fail_msg: "hadoop_replication_factor must be a positive integer (got '{{ hadoop_replication_factor }}')."
+    quiet: true
+  run_once: true
+
+- name: Validate | Extra *-site dictionaries are mappings
+  ansible.builtin.assert:
+    that:
+      - (hadoop_extra_core_site | default({}, true)) is mapping
+      - (hadoop_extra_hdfs_site | default({}, true)) is mapping
+      - (hadoop_extra_yarn_site | default({}, true)) is mapping
+      - (hadoop_extra_mapred_site | default({}, true)) is mapping
+    fail_msg: "hadoop_extra_core_site / _hdfs_site / _yarn_site / _mapred_site must be dictionaries."
+    quiet: true
+  run_once: true
+
+# ---------------------------------------------------------------------------
+# scale_out
+# ---------------------------------------------------------------------------
+- name: Validate | scale_out needs hadoop_new_nodes
+  ansible.builtin.assert:
+    that:
+      - hadoop_new_node_list | length > 0
+      - hadoop_new_node_list | difference(hadoop_dn_hosts) | length == 0
+    fail_msg: >-
+      hadoop_action=scale_out requires hadoop_new_nodes to be a non-empty list
+      of inventory hostnames that are already members of the 'hadoop_datanode'
+      group. Unknown: {{ hadoop_new_node_list | difference(hadoop_dn_hosts) }}.
+      (Only worker nodes - DataNode + NodeManager - can be added online.)
+    quiet: true
+  run_once: true
+  when: hadoop_action == 'scale_out'
+
+# ---------------------------------------------------------------------------
+# decommission
+# ---------------------------------------------------------------------------
+- name: Validate | decommission needs hadoop_decommission_nodes
+  ansible.builtin.assert:
+    that:
+      - hadoop_decom_node_list | length > 0
+      - hadoop_decom_node_list | difference(hadoop_dn_hosts) | length == 0
+    fail_msg: >-
+      hadoop_action=decommission requires hadoop_decommission_nodes to be a
+      non-empty list of inventory hostnames from the 'hadoop_datanode' group.
+      Unknown: {{ hadoop_decom_node_list | difference(hadoop_dn_hosts) }}.
+    quiet: true
+  run_once: true
+  when: hadoop_action == 'decommission'
+
+- name: Validate | Enough DataNodes remain after the decommission
+  ansible.builtin.assert:
+    that:
+      - (hadoop_dn_hosts | difference(hadoop_decom_node_list) | length) >= ([hadoop_replication_factor | int, 1] | max)
+    fail_msg: >-
+      Decommissioning {{ hadoop_decom_node_list | length }} node(s) would leave
+      {{ hadoop_dn_hosts | difference(hadoop_decom_node_list) | length }} DataNode(s),
+      fewer than the replication factor ({{ hadoop_replication_factor }}). Blocks
+      could never be fully re-replicated and the decommission would hang. Lower
+      the replication factor first, or pass hadoop_decommission_force=true.
+    quiet: true
+  run_once: true
+  when:
+    - hadoop_action == 'decommission'
+    - not (hadoop_decommission_force | bool)
+
+# ---------------------------------------------------------------------------
+# uninstall: refuse obviously dangerous paths before any `state: absent`
+# ---------------------------------------------------------------------------
+- name: Validate | Paths are safe to remove on uninstall
+  ansible.builtin.assert:
+    that:
+      - hadoop_install_dir is match('^/[^/]+/[^/]+')
+      - hadoop_conf_dir is match('^/[^/]+/[^/]+')
+      - hadoop_log_dir is match('^/[^/]+/[^/]+')
+      - hadoop_zookeeper_install_dir is match('^/[^/]+/[^/]+')
+      - hadoop_zookeeper_data_dir is match('^/[^/]+/[^/]+')
+      - (hadoop_all_storage_dirs | reject('match', '^/[^/]+/[^/]+') | list | length) == 0
+    fail_msg: >-
+      Refusing to uninstall: every Hadoop/ZooKeeper directory must be at least
+      two levels deep (e.g. /opt/hadoop, /data/hadoop/dn) so that a top-level
+      directory such as /data or /opt can never be removed recursively.
+    quiet: true
+  run_once: true
+  when: hadoop_action == 'uninstall'

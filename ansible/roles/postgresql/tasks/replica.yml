@@ -1,0 +1,103 @@
+---
+# Full install of a streaming replica. Used by `install` (replication mode)
+# and by `add_replica`. Safe to re-run: a host that already is a standby
+# keeps its data, only configuration is converged.
+#
+# Order matters:
+#   packages -> prepare the primary (role, slot, pg_hba) -> base backup
+#   -> render configuration -> start -> verify
+# The configuration is rendered AFTER the base backup because on the RedHat
+# family postgresql.conf / pg_hba.conf live in the data directory, which
+# pg_basebackup needs to be empty (and then fills with the primary's copies).
+
+- name: Replica | load variables
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Replica | a primary must be defined
+  ansible.builtin.assert:
+    that:
+      - __pg_primary_host | length > 0
+      - __pg_primary_host != inventory_hostname
+      - postgresql_replication_password | string | length > 0
+    fail_msg: "A replica needs a host in postgresql_primary and postgresql_replication_password"
+    quiet: true
+
+- name: Replica | summary
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} ({{ __pg_self_addr }}, {{ ansible_distribution }} {{ ansible_distribution_version }}):
+      PostgreSQL {{ __pg_version }} replica of {{ __pg_primary_host }} ({{ __pg_primary_addr }}:{{ postgresql_port }}),
+      data={{ __pg_data_dir }}, slot={{ __pg_slot_name }}
+
+- name: Replica | packages
+  ansible.builtin.include_tasks: install.yml
+
+- name: Replica | data directory plumbing
+  ansible.builtin.include_tasks: datadir.yml
+
+- name: Replica | SELinux
+  ansible.builtin.include_tasks: selinux.yml
+  when:
+    - postgresql_manage_selinux | bool
+    - ansible_os_family == 'RedHat'
+
+- name: Replica | firewall
+  ansible.builtin.include_tasks: firewall.yml
+  vars:
+    __pg_fw_state: open
+  when: postgresql_manage_firewall | bool
+
+# Debian keeps the configuration in /etc/postgresql/<ver>/main and that
+# directory (plus start.conf, pg_ctl.conf, the systemd instance) only exists
+# for a cluster registered with pg_createcluster. So a throw-away cluster is
+# created to get the layout; its data directory is tagged with a marker file
+# so basebackup.yml knows it may be replaced.
+- name: Replica | register a placeholder cluster (Debian)
+  when: ansible_os_family == 'Debian'
+  block:
+    - name: Replica | cluster already registered?
+      ansible.builtin.stat:
+        path: "{{ __pg_conf_file }}"
+      register: __pg_replica_conf
+
+    - name: Replica | pg_createcluster placeholder
+      ansible.builtin.command:
+        cmd: >-
+          pg_createcluster {{ __pg_version }} main
+          -d {{ __pg_data_dir }} -p {{ postgresql_port }}
+        creates: "{{ __pg_conf_file }}"
+      when: not __pg_replica_conf.stat.exists
+
+    - name: Replica | tag the placeholder data directory
+      ansible.builtin.copy:
+        dest: "{{ __pg_seed_marker }}"
+        content: "placeholder cluster created by Ansible; replaced by a base backup\n"
+        owner: postgres
+        group: postgres
+        mode: "0600"
+      when: not __pg_replica_conf.stat.exists
+
+- name: Replica | prepare the primary (role, slot, pg_hba)
+  ansible.builtin.include_tasks: primary_prep.yml
+
+- name: Replica | base backup
+  ansible.builtin.include_tasks: basebackup.yml
+
+- name: Replica | configuration and service
+  ansible.builtin.include_tasks: configure.yml
+
+- name: Replica | wait until it is streaming from the primary
+  ansible.builtin.command: "{{ __pg_psql }}"
+  args:
+    stdin: "SELECT pg_is_in_recovery()::text || '|' || coalesce((SELECT status FROM pg_stat_wal_receiver LIMIT 1), 'none');"
+  become: true
+  become_user: postgres
+  register: __pg_replica_state
+  changed_when: false
+  retries: 60
+  delay: 3
+  until: (__pg_replica_state.stdout | default('') | trim) == 'true|streaming'
+
+- name: Replica | result
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} is in recovery and streaming from {{ __pg_primary_addr }}:{{ postgresql_port }}"

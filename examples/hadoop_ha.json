@@ -1,0 +1,19 @@
+{
+  "version": "3.3.6",
+  "mode": "ha",
+  "roles": {
+    "hadoop_namenode": ["an-master-01"],
+    "hadoop_standby_namenode": ["an-master-02"],
+    "hadoop_journalnode": ["an-master-01", "an-master-02", "an-master-03"],
+    "hadoop_zookeeper": ["an-master-01", "an-master-02", "an-master-03"],
+    "hadoop_resourcemanager": ["an-master-01", "an-master-02"],
+    "hadoop_historyserver": ["an-master-03"],
+    "hadoop_datanode": ["an-worker-01", "an-worker-02", "an-worker-03", "an-worker-04"]
+  },
+  "vars": {
+    "hadoop_replication_factor": 3,
+    "hadoop_data_dirs": ["/data/1/dn", "/data/2/dn"],
+    "hadoop_heap_size_mb": 2048
+  },
+  "install_java": true
+}

@@ -1,0 +1,17 @@
+---
+# RHEL / CentOS / Rocky / Alma layout (PGDG packages):
+#   everything under /var/lib/pgsql/<ver>/data (config lives in the data dir)
+#   service postgresql-<ver>, binaries in /usr/pgsql-<ver>/bin
+#   cluster is created with /usr/pgsql-<ver>/bin/postgresql-<ver>-setup initdb
+__pg_os_prereq_packages:
+  - ca-certificates
+__pg_os_packages:
+  - "postgresql{{ __pg_version }}-server"
+  - "postgresql{{ __pg_version }}"
+  - "postgresql{{ __pg_version }}-contrib"
+__pg_os_service: "postgresql-{{ __pg_version }}"
+__pg_os_enable_service: "postgresql-{{ __pg_version }}"
+__pg_os_data_dir: "/var/lib/pgsql/{{ __pg_version }}/data"
+__pg_os_conf_dir: "{{ __pg_data_dir }}"
+__pg_os_bin_dir: "/usr/pgsql-{{ __pg_version }}/bin"
+__pg_os_home: /var/lib/pgsql

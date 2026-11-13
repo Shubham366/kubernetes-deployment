@@ -1,0 +1,26 @@
+---
+# Package repository + server packages. Does NOT create a database cluster:
+# that is initdb.yml (primary) or basebackup.yml (replica).
+
+- name: Install | repository and packages (Debian)
+  ansible.builtin.include_tasks: install_debian.yml
+  when: ansible_os_family == 'Debian'
+
+- name: Install | repository and packages (RedHat)
+  ansible.builtin.include_tasks: install_redhat.yml
+  when: ansible_os_family == 'RedHat'
+
+- name: Install | extra packages
+  ansible.builtin.package:
+    name: "{{ postgresql_extra_packages }}"
+    state: present
+  when: postgresql_extra_packages | length > 0
+
+- name: Install | installed server version
+  ansible.builtin.command: "{{ __pg_bin_dir }}/postgres --version"
+  register: __pg_installed_version
+  changed_when: false
+
+- name: Install | show installed server version
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }}: {{ __pg_installed_version.stdout }}"

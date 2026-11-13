@@ -1,0 +1,49 @@
+---
+# Entry point when the role is used directly (`roles: [postgresql]`).
+#
+# playbooks/software/postgresql.yml does NOT come through here: it calls the
+# task files with `tasks_from` because the multi-node flows need a specific
+# play order (primary -> replicas -> synchronous settings, fence -> promote ->
+# re-point, ...). This dispatcher runs the per-host part of each action, so
+# for replication the caller is responsible for running the primary first.
+
+- name: Validate topology and variables
+  ansible.builtin.include_tasks: preflight.yml
+
+- name: Install primary
+  ansible.builtin.include_tasks: primary.yml
+  when:
+    - postgresql_action == 'install'
+    - inventory_hostname in groups.get('postgresql_primary', [])
+
+- name: Install replica
+  ansible.builtin.include_tasks: replica.yml
+  when:
+    - inventory_hostname in groups.get('postgresql_replica', [])
+    - >-
+      (postgresql_action == 'install' and postgresql_mode == 'replication')
+      or (postgresql_action == 'add_replica' and inventory_hostname in postgresql_new_replicas)
+
+- name: Synchronous replication settings
+  ansible.builtin.include_tasks: sync.yml
+  when:
+    - postgresql_action in ['install', 'add_replica']
+    - inventory_hostname in groups.get('postgresql_primary', [])
+
+- name: Start / stop / restart
+  ansible.builtin.include_tasks: service_action.yml
+  when: postgresql_action in ['start', 'stop', 'restart']
+
+- name: Promote
+  ansible.builtin.include_tasks: promote.yml
+  when:
+    - postgresql_action == 'promote'
+    - inventory_hostname == postgresql_promote_host
+
+- name: Status
+  ansible.builtin.include_tasks: status.yml
+  when: postgresql_action == 'status'
+
+- name: Uninstall
+  ansible.builtin.include_tasks: uninstall.yml
+  when: postgresql_action == 'uninstall'

@@ -1,0 +1,26 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Redis Sentinel (port {{ redis_sentinel_port }}, master {{ redis_sentinel_master_name }})
+Documentation=https://redis.io/docs/management/sentinel/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ redis_user }}
+Group={{ redis_group }}
+# `redis-server <conf> --sentinel` works with every packaging of redis (the
+# redis-sentinel binary is just a symlink to redis-server, and is a separate
+# package on Debian).
+ExecStart={{ __redis_server_bin }} {{ __redis_sentinel_conf_file }} --sentinel --daemonize no --supervised no
+Restart=on-failure
+RestartSec=3
+LimitNOFILE={{ redis_limit_nofile }}
+# sentinel persists its state by rewriting its own config file
+ReadWritePaths=-{{ redis_conf_dir }} -{{ redis_data_dir }} -{{ redis_log_dir }}
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

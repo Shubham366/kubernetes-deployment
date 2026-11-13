@@ -1,0 +1,35 @@
+# {{ ansible_managed }}
+#
+# Redis Sentinel on {{ inventory_hostname }} ({{ __redis_self_addr }})
+#
+# This is only the SEED configuration. Sentinel rewrites the live file with
+# the discovered replicas/sentinels and the current master after failovers.
+
+bind {{ __redis_bind_effective }}
+port {{ redis_sentinel_port }}
+# Other sentinels and clients must be able to reach this instance.
+protected-mode no
+daemonize no
+supervised no
+logfile "{{ __redis_sentinel_log_file }}"
+dir {{ __redis_sentinel_dir }}
+
+{% if not (__redis_master_addr is match(__redis_ipv4_re)) %}
+# The master is addressed by name: needs Redis >= 6.2
+sentinel resolve-hostnames yes
+sentinel announce-hostnames no
+{% endif %}
+{% if __redis_bind_ip != '0.0.0.0' %}
+sentinel announce-ip {{ __redis_bind_ip }}
+sentinel announce-port {{ redis_sentinel_port }}
+{% endif %}
+
+# sentinel monitor <name> <master-ip> <master-port> <quorum>
+# quorum {{ __redis_sentinel_quorum | trim }} of {{ __redis_sentinel_group | length }} sentinel(s)
+sentinel monitor {{ redis_sentinel_master_name }} {{ __redis_master_addr }} {{ redis_port }} {{ __redis_sentinel_quorum | trim }}
+{% if redis_password | string | length > 0 %}
+sentinel auth-pass {{ redis_sentinel_master_name }} {{ redis_password }}
+{% endif %}
+sentinel down-after-milliseconds {{ redis_sentinel_master_name }} {{ redis_sentinel_down_after_ms }}
+sentinel failover-timeout {{ redis_sentinel_master_name }} {{ redis_sentinel_failover_timeout_ms }}
+sentinel parallel-syncs {{ redis_sentinel_master_name }} {{ redis_sentinel_parallel_syncs }}

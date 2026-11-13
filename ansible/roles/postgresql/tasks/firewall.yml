@@ -1,0 +1,65 @@
+---
+# Opens (or closes) the PostgreSQL port in firewalld / ufw, but only when one of
+# them is actually active on the host. No firewall collections are used:
+# plain firewall-cmd / ufw with changed_when derived from their output.
+#
+# Input:
+#   __pg_fw_ports  list of TCP ports (defaults to [postgresql_port])
+#   __pg_fw_state  open | closed
+
+- name: Firewall | default port list
+  ansible.builtin.set_fact:
+    __pg_fw_ports: ["{{ postgresql_port | int }}"]
+
+- name: Firewall | ports for this host
+  ansible.builtin.debug:
+    msg: "postgresql firewall ports on {{ inventory_hostname }} -> {{ __pg_fw_state }}: {{ __pg_fw_ports }}"
+
+# ------------------------------- firewalld -----------------------------------
+- name: Firewall | is firewalld running
+  ansible.builtin.command: systemctl is-active firewalld
+  register: __pg_firewalld
+  changed_when: false
+  failed_when: false
+
+- name: Firewall | firewalld
+  when: __pg_firewalld.rc == 0
+  block:
+    # firewall-cmd exits 0 and prints "Warning: ALREADY_ENABLED" (stderr) when
+    # the port is already open, "NOT_ENABLED" when removing a closed one.
+    - name: Firewall | firewalld permanent rules
+      ansible.builtin.command: >-
+        firewall-cmd --permanent
+        --{{ 'add' if __pg_fw_state == 'open' else 'remove' }}-port={{ item }}/tcp
+      loop: "{{ __pg_fw_ports }}"
+      register: __pg_firewalld_rules
+      changed_when:
+        - "'ALREADY_ENABLED' not in __pg_firewalld_rules.stderr"
+        - "'NOT_ENABLED' not in __pg_firewalld_rules.stderr"
+
+    - name: Firewall | firewalld reload
+      ansible.builtin.command: firewall-cmd --reload
+      changed_when: true
+      when: __pg_firewalld_rules is changed
+
+# ---------------------------------- ufw --------------------------------------
+- name: Firewall | is ufw active
+  ansible.builtin.command: ufw status
+  register: __pg_ufw
+  changed_when: false
+  failed_when: false
+
+- name: Firewall | ufw
+  when:
+    - __pg_ufw.rc | default(1) == 0
+    - "'Status: active' in (__pg_ufw.stdout | default(''))"
+  block:
+    # "Skipping adding existing rule" / "Could not delete non-existent rule"
+    - name: Firewall | ufw rules
+      ansible.builtin.command: >-
+        ufw {{ 'allow' if __pg_fw_state == 'open' else 'delete allow' }} {{ item }}/tcp
+      loop: "{{ __pg_fw_ports }}"
+      register: __pg_ufw_rules
+      changed_when:
+        - "'Skipping' not in __pg_ufw_rules.stdout"
+        - "'non-existent' not in __pg_ufw_rules.stdout"

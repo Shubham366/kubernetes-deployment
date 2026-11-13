@@ -1,0 +1,155 @@
+---
+# postgresql_action = status
+# Read-only; nothing here fails the play. A stopped or unreachable server is
+# reported as such. Raw query output is printed with debug and a compact
+# summary dict ("postgresql_status") comes last.
+#
+# The role is taken from the server itself (pg_is_in_recovery), not from the
+# inventory group, so a stale inventory after a failover is visible here.
+
+- name: Status | load variables
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Status | unit state
+  ansible.builtin.command: "systemctl is-active {{ __pg_service }}"
+  register: __pg_st_unit
+  changed_when: false
+  failed_when: false
+
+- name: Status | unit enabled
+  ansible.builtin.command: "systemctl is-enabled {{ __pg_os_enable_service }}"
+  register: __pg_st_enabled
+  changed_when: false
+  failed_when: false
+
+- name: Status | accepting connections
+  ansible.builtin.command: "{{ __pg_bin_dir }}/pg_isready -h {{ __pg_socket_dir }} -p {{ postgresql_port }}"
+  register: __pg_st_ready
+  changed_when: false
+  failed_when: false
+
+- name: Status | queries
+  when: __pg_st_ready.rc | default(1) == 0
+  block:
+    - name: Status | version, recovery state, uptime
+      ansible.builtin.command: "{{ __pg_psql }}"
+      args:
+        stdin: >-
+          SELECT current_setting('server_version')
+          || '|' || pg_is_in_recovery()::text
+          || '|' || date_trunc('second', now() - pg_postmaster_start_time())::text
+          || '|' || (SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend')::text
+          || '|' || current_setting('max_connections')
+          || '|' || current_setting('synchronous_standby_names');
+      become: true
+      become_user: postgres
+      register: __pg_st_basic
+      changed_when: false
+      failed_when: false
+
+    - name: Status | databases
+      ansible.builtin.command: "{{ __pg_psql }}"
+      args:
+        stdin: >-
+          SELECT datname || ' owner=' || pg_get_userbyid(datdba) || ' size=' || pg_size_pretty(pg_database_size(datname))
+          FROM pg_database WHERE NOT datistemplate ORDER BY 1;
+      become: true
+      become_user: postgres
+      register: __pg_st_dbs
+      changed_when: false
+      failed_when: false
+
+    # --- as seen from a primary: who is connected to me -----------------------
+    - name: Status | pg_stat_replication
+      ansible.builtin.command: "{{ __pg_psql }}"
+      args:
+        stdin: >-
+          SELECT 'standby=' || application_name
+          || ' addr=' || coalesce(client_addr::text, 'local')
+          || ' state=' || state
+          || ' sync_state=' || sync_state
+          || ' sent_lsn=' || coalesce(sent_lsn::text, '-')
+          || ' replay_lsn=' || coalesce(replay_lsn::text, '-')
+          || ' replay_lag_bytes=' || coalesce(pg_wal_lsn_diff(sent_lsn, replay_lsn)::text, '-')
+          || ' replay_lag=' || coalesce(replay_lag::text, '-')
+          FROM pg_stat_replication ORDER BY application_name;
+      become: true
+      become_user: postgres
+      register: __pg_st_repl
+      changed_when: false
+      failed_when: false
+
+    - name: Status | replication slots
+      ansible.builtin.command: "{{ __pg_psql }}"
+      args:
+        stdin: >-
+          SELECT 'slot=' || slot_name || ' type=' || slot_type || ' active=' || active::text
+          || ' restart_lsn=' || coalesce(restart_lsn::text, '-')
+          FROM pg_replication_slots ORDER BY slot_name;
+      become: true
+      become_user: postgres
+      register: __pg_st_slots
+      changed_when: false
+      failed_when: false
+
+    # --- as seen from a standby: where do I get WAL from ----------------------
+    - name: Status | pg_stat_wal_receiver and replay delay
+      ansible.builtin.command: "{{ __pg_psql }}"
+      args:
+        stdin: >-
+          SELECT 'wal_receiver=' || coalesce((SELECT status FROM pg_stat_wal_receiver LIMIT 1), 'none')
+          || ' primary=' || coalesce((SELECT sender_host || ':' || sender_port FROM pg_stat_wal_receiver LIMIT 1), '-')
+          || ' slot=' || coalesce((SELECT slot_name FROM pg_stat_wal_receiver LIMIT 1), '-')
+          || ' receive_lsn=' || coalesce(pg_last_wal_receive_lsn()::text, '-')
+          || ' replay_lsn=' || coalesce(pg_last_wal_replay_lsn()::text, '-')
+          || ' replay_delay=' || coalesce(date_trunc('second', now() - pg_last_xact_replay_timestamp())::text, '-')
+          WHERE pg_is_in_recovery();
+      become: true
+      become_user: postgres
+      register: __pg_st_recv
+      changed_when: false
+      failed_when: false
+
+    - name: Status | print pg_is_in_recovery
+      ansible.builtin.debug:
+        msg: "pg_is_in_recovery = {{ (__pg_st_basic.stdout | default('') | trim).split('|')[1] | default('unknown') }}"
+
+    - name: Status | print pg_stat_replication
+      ansible.builtin.debug:
+        msg: "{{ (__pg_st_repl.stdout_lines | default([])) or ['no standbys connected'] }}"
+
+    - name: Status | print WAL receiver
+      ansible.builtin.debug:
+        msg: "{{ (__pg_st_recv.stdout_lines | default([])) or ['not a standby'] }}"
+
+- name: Status | split basic info
+  ansible.builtin.set_fact:
+    __pg_st_fields: "{{ (__pg_st_basic.stdout | default('') | trim).split('|') }}"
+
+- name: Status | postgresql_status
+  ansible.builtin.debug:
+    msg:
+      postgresql_status:
+        host: "{{ inventory_hostname }}"
+        address: "{{ __pg_self_addr }}"
+        node_id: "{{ node_id | default('') }}"
+        inventory_role: "{{ 'primary' if __pg_is_primary | bool else 'replica' }}"
+        service: "{{ __pg_service }}"
+        active: "{{ __pg_st_unit.stdout | default('unknown') | trim }}"
+        enabled: "{{ __pg_st_enabled.stdout | default('unknown') | trim }}"
+        accepting_connections: "{{ (__pg_st_ready.rc | default(1)) == 0 }}"
+        port: "{{ postgresql_port }}"
+        data_dir: "{{ __pg_data_dir }}"
+        version: "{{ __pg_st_fields[0] | default('unknown', true) }}"
+        in_recovery: "{{ __pg_st_fields[1] | default('unknown') }}"
+        actual_role: >-
+          {{ 'standby' if (__pg_st_fields[1] | default('')) == 'true'
+             else ('primary' if (__pg_st_fields[1] | default('')) == 'false' else 'unknown') }}
+        uptime: "{{ __pg_st_fields[2] | default('') }}"
+        client_connections: "{{ __pg_st_fields[3] | default('') }}"
+        max_connections: "{{ __pg_st_fields[4] | default('') }}"
+        synchronous_standby_names: "{{ __pg_st_fields[5] | default('') }}"
+        databases: "{{ __pg_st_dbs.stdout_lines | default([]) }}"
+        standbys: "{{ __pg_st_repl.stdout_lines | default([]) }}"
+        replication_slots: "{{ __pg_st_slots.stdout_lines | default([]) }}"
+        wal_receiver: "{{ __pg_st_recv.stdout_lines | default([]) }}"

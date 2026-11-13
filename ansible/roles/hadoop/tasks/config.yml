@@ -1,0 +1,48 @@
+---
+# =============================================================================
+# Hadoop configuration
+#
+# Each *-site.xml template builds a dict of generated properties and merges
+# the matching hadoop_extra_*_site dict over it, so the backend can override
+# or add any property without touching the role.
+#
+# A change in any of these files notifies "hadoop config changed". The handler
+# only records a fact; the start stage of the playbook then restarts (instead
+# of merely starting) the daemons, in dependency order.
+# =============================================================================
+
+- name: Config | JAVA_HOME must be known
+  ansible.builtin.assert:
+    that:
+      - hadoop_java_home_resolved is defined
+      - hadoop_java_home_resolved | length > 0
+    fail_msg: "JAVA_HOME has not been resolved on {{ inventory_hostname }} - java.yml must run before config.yml."
+    quiet: true
+
+- name: Config | Render site files and environment
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ hadoop_conf_dir }}/{{ item.dest }}"
+    owner: "{{ hadoop_user }}"
+    group: "{{ hadoop_group }}"
+    mode: "{{ item.mode | default('0644') }}"
+    backup: true
+  loop:
+    - { src: core-site.xml.j2, dest: core-site.xml }
+    - { src: hdfs-site.xml.j2, dest: hdfs-site.xml }
+    - { src: yarn-site.xml.j2, dest: yarn-site.xml }
+    - { src: mapred-site.xml.j2, dest: mapred-site.xml }
+    - { src: hadoop-env.sh.j2, dest: hadoop-env.sh, mode: "0755" }
+  loop_control:
+    label: "{{ item.dest }}"
+  notify: hadoop config changed
+
+# `backup: true` above leaves timestamped copies behind; keep the newest few.
+- name: Config | Prune old configuration backups
+  ansible.builtin.shell: |
+    cd {{ hadoop_conf_dir | quote }} || exit 0
+    ls -1t *.xml.*~ *.sh.*~ 2>/dev/null | tail -n +11 | while read -r f; do rm -f -- "$f"; done
+  args:
+    executable: /bin/sh
+  changed_when: false
+  failed_when: false

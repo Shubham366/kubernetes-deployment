@@ -1,0 +1,46 @@
+---
+# =============================================================================
+# Generic service control for the daemons of *this* host.
+#
+# Parameters (pass with `vars:` on the include):
+#   hadoop_svc_daemons  list of daemon names to act on (see hadoop_daemon_defs);
+#                       daemons this host does not run are ignored
+#   hadoop_svc_state    started | restarted | stopped
+#   hadoop_svc_enable   optional bool - also enable/disable the unit at boot
+#
+# Start/restart walk the daemons in dependency order, stop in reverse, and a
+# (re)start waits for the daemon's port so that the next stage of the playbook
+# only begins once this one actually listens.
+# =============================================================================
+
+- name: Service | Daemons to act on
+  ansible.builtin.set_fact:
+    hadoop_svc_targets: >-
+      {{ (hadoop_daemon_order | reverse | list if hadoop_svc_state == 'stopped' else hadoop_daemon_order)
+         | select('in', hadoop_svc_daemons) | select('in', hadoop_host_daemons) | list }}
+
+# A stop must not fail because the unit was never installed (stop/uninstall on
+# a half-installed node); anything else is a real error.
+- name: "Service | Set state '{{ hadoop_svc_state }}'"
+  ansible.builtin.systemd:
+    name: "{{ hadoop_daemon_defs[item].unit }}.service"
+    state: "{{ hadoop_svc_state }}"
+    enabled: "{{ hadoop_svc_enable | default(omit) }}"
+  loop: "{{ hadoop_svc_targets }}"
+  register: hadoop_svc_result
+  failed_when:
+    - hadoop_svc_result.failed | default(false)
+    - not (hadoop_svc_state == 'stopped'
+           and (hadoop_svc_result.msg | default('')) is search('Could not find the requested service|not found|not-found|could not be found'))
+
+- name: Service | Wait for the daemons to listen
+  ansible.builtin.wait_for:
+    host: "{{ hadoop_self_addr }}"
+    port: "{{ hadoop_daemon_defs[item].port | int }}"
+    timeout: "{{ hadoop_service_start_timeout }}"
+    msg: >-
+      {{ hadoop_daemon_defs[item].desc }} on {{ inventory_hostname }} did not open port
+      {{ hadoop_daemon_defs[item].port }} within {{ hadoop_service_start_timeout }}s. Check
+      `journalctl -u {{ hadoop_daemon_defs[item].unit }}` and {{ hadoop_log_dir }}.
+  loop: "{{ hadoop_svc_targets }}"
+  when: hadoop_svc_state in ['started', 'restarted']

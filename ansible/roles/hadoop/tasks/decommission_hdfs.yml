@@ -1,0 +1,99 @@
+---
+# =============================================================================
+# Graceful DataNode decommission - runs once on the primary NameNode.
+#
+# membership.yml has already appended the nodes to dfs.exclude on every node.
+# refreshNodes makes the NameNode(s) re-read it; the affected DataNodes then go
+#   Normal -> Decommission in progress -> Decommissioned
+# while their blocks are re-replicated elsewhere. Only when a node reports
+# "Decommissioned" is it safe to stop - which the playbook does afterwards.
+# =============================================================================
+
+- name: Decommission | Count the live DataNodes
+  ansible.builtin.shell: |
+    {{ hadoop_hdfs }} dfsadmin -report -live | sed -n 's/^Live datanodes (\([0-9][0-9]*\)).*/\1/p' | head -n 1
+  args:
+    executable: /bin/sh
+  become: true
+  become_user: "{{ hadoop_user }}"
+  register: hadoop_live_count
+  changed_when: false
+
+# The inventory-based check in validate.yml cannot know about dead nodes.
+- name: Decommission | Enough live DataNodes will remain
+  ansible.builtin.assert:
+    that:
+      - ((hadoop_live_count.stdout | default('0', true) | int) - (hadoop_decom_node_list | length)) >= (hadoop_replication_factor | int)
+    fail_msg: >-
+      {{ hadoop_live_count.stdout | default('0', true) }} DataNode(s) are live; removing
+      {{ hadoop_decom_node_list | length }} leaves fewer than the replication factor
+      ({{ hadoop_replication_factor }}), so re-replication could never finish.
+      Pass hadoop_decommission_force=true to try anyway.
+    quiet: true
+  when: not (hadoop_decommission_force | bool)
+
+- name: Decommission | Exclude file as seen by the NameNode
+  ansible.builtin.command:
+    cmd: "cat {{ hadoop_exclude_file }}"
+  register: hadoop_exclude_content
+  changed_when: false
+
+- name: Decommission | Nodes being decommissioned
+  ansible.builtin.debug:
+    msg:
+      requested: "{{ hadoop_decom_node_list }}"
+      exclude_file: "{{ hadoop_exclude_content.stdout_lines }}"
+
+# In HA this is sent to every NameNode of the nameservice.
+- name: Decommission | Tell the NameNode(s) to re-read the exclude file
+  ansible.builtin.command:
+    cmd: "{{ hadoop_hdfs }} dfsadmin -refreshNodes"
+  become: true
+  become_user: "{{ hadoop_user }}"
+  changed_when: true
+
+# "-report -decommissioning" lists only nodes still in progress. Poll until
+# it is empty or hadoop_decommission_timeout has elapsed.
+- name: Decommission | Wait for block re-replication to finish
+  ansible.builtin.command:
+    cmd: "{{ hadoop_hdfs }} dfsadmin -report -decommissioning"
+  become: true
+  become_user: "{{ hadoop_user }}"
+  register: hadoop_decom_progress
+  changed_when: false
+  until: >-
+    hadoop_decom_progress.rc == 0
+    and 'Decommission in progress' not in hadoop_decom_progress.stdout
+  retries: "{{ ((hadoop_decommission_timeout | int) / (hadoop_decommission_poll_interval | int)) | round(0, 'ceil') | int }}"
+  delay: "{{ hadoop_decommission_poll_interval | int }}"
+
+- name: Decommission | Final state of all DataNodes
+  ansible.builtin.shell: |
+    {{ hadoop_hdfs }} dfsadmin -report | grep -E '^(Name|Hostname|Decommission Status|Last contact)'
+  args:
+    executable: /bin/sh
+  become: true
+  become_user: "{{ hadoop_user }}"
+  register: hadoop_decom_final
+  changed_when: false
+  failed_when: false
+
+- name: Decommission | Result
+  ansible.builtin.debug:
+    msg: "{{ hadoop_decom_final.stdout_lines | default([]) }}"
+
+# Nothing may be left under-replicated because of the removal.
+- name: Decommission | Filesystem health after the decommission
+  ansible.builtin.shell: |
+    {{ hadoop_hdfs }} fsck / 2>/dev/null | tail -n 25
+  args:
+    executable: /bin/sh
+  become: true
+  become_user: "{{ hadoop_user }}"
+  register: hadoop_decom_fsck
+  changed_when: false
+  failed_when: false
+
+- name: Decommission | fsck summary
+  ansible.builtin.debug:
+    msg: "{{ hadoop_decom_fsck.stdout_lines | default([]) }}"

@@ -1,0 +1,40 @@
+---
+# SELinux (RedHat family). Only relevant for package installs, where
+# /usr/bin/redis-server runs confined as redis_t and may only bind ports
+# labelled redis_port_t (6379, 16379, 26379 by default). Source builds under
+# /usr/local/bin run unconfined, labelling the ports there is harmless.
+# Everything here is best effort: a failure never aborts the install.
+
+- name: SELinux | current mode
+  ansible.builtin.command: getenforce
+  register: __redis_getenforce
+  changed_when: false
+  failed_when: false
+
+- name: SELinux | label non-default ports
+  when:
+    - __redis_getenforce.rc | default(1) == 0
+    - (__redis_getenforce.stdout | default('Disabled') | trim) != 'Disabled'
+  block:
+    - name: SELinux | semanage tooling
+      ansible.builtin.package:
+        name: "{{ 'policycoreutils-python' if (ansible_distribution_major_version | int <= 7) else 'policycoreutils-python-utils' }}"
+        state: present
+      failed_when: false
+
+    - name: SELinux | ports already labelled redis_port_t
+      ansible.builtin.shell: "semanage port -l | grep -E '^redis_port_t\\s+tcp' || true"
+      register: __redis_semanage_ports
+      changed_when: false
+      failed_when: false
+
+    # -a fails if the port already has another label; -m then relabels it.
+    - name: SELinux | add redis_port_t label
+      ansible.builtin.shell: >-
+        semanage port -a -t redis_port_t -p tcp {{ item }}
+        || semanage port -m -t redis_port_t -p tcp {{ item }}
+      loop: "{{ __redis_fw_ports }}"
+      register: __redis_semanage_add
+      changed_when: __redis_semanage_add.rc == 0
+      failed_when: false
+      when: (item | string) not in (__redis_semanage_ports.stdout | default('') | regex_findall('[0-9]+'))

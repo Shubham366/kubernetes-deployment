@@ -1,0 +1,106 @@
+---
+# =============================================================================
+# Per-node status (hadoop_action=status) - read-only.
+#
+# Collects, for the daemons this host is supposed to run:
+#   systemd state of each unit, the JVMs that are really there (jps), whether
+#   each daemon's port answers, ZooKeeper's role, and disk usage of the
+#   storage directories. Printed with debug, and also published as the fact
+#   hadoop_node_status for anything that wants to consume it.
+# =============================================================================
+
+- name: Status | systemd state of each expected daemon
+  ansible.builtin.command:
+    cmd: "systemctl is-active {{ hadoop_daemon_defs[item].unit }}.service"
+  loop: "{{ hadoop_host_daemons }}"
+  register: hadoop_status_units
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Status | Probe the daemon ports
+  ansible.builtin.wait_for:
+    host: "{{ hadoop_self_addr }}"
+    port: "{{ hadoop_daemon_defs[item].port | int }}"
+    timeout: 3
+  loop: "{{ hadoop_host_daemons }}"
+  register: hadoop_status_ports
+  failed_when: false
+  check_mode: false
+
+# jps as root lists the JVMs of every user. JAVA_HOME comes from the
+# profile.d file written at install time; fall back to whatever is on PATH.
+- name: Status | Java processes (jps)
+  ansible.builtin.shell: |
+    [ -r /etc/profile.d/hadoop.sh ] && . /etc/profile.d/hadoop.sh
+    if [ -n "${JAVA_HOME:-}" ] && [ -x "${JAVA_HOME}/bin/jps" ]; then
+      "${JAVA_HOME}/bin/jps" -l
+    elif command -v jps >/dev/null 2>&1; then
+      jps -l
+    else
+      ps -eo pid,user,args | grep -E '[o]rg\.apache\.(hadoop|zookeeper)' | awk '{print $1, $2, $NF}'
+    fi
+  args:
+    executable: /bin/sh
+  register: hadoop_status_jps
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Status | Installed Hadoop version
+  ansible.builtin.shell: |
+    readlink -f {{ hadoop_current | quote }} 2>/dev/null || echo "not installed"
+  args:
+    executable: /bin/sh
+  register: hadoop_status_version
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Status | ZooKeeper role (leader / follower / standalone)
+  ansible.builtin.shell: |
+    {{ hadoop_zk_current }}/bin/zkServer.sh --config {{ hadoop_zookeeper_conf_dir }} status 2>&1 | grep -E 'Mode:|Error|not running' || true
+  args:
+    executable: /bin/sh
+  register: hadoop_status_zk
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: inventory_hostname in hadoop_zk_hosts
+
+- name: Status | Disk usage of the storage directories
+  ansible.builtin.shell: |
+    df -Ph {{ hadoop_host_storage_dirs | map('quote') | join(' ') }} 2>/dev/null | awk 'NR==1 || !seen[$0]++'
+  args:
+    executable: /bin/sh
+  register: hadoop_status_df
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Status | Assemble the node status
+  ansible.builtin.set_fact:
+    hadoop_node_status:
+      host: "{{ inventory_hostname }}"
+      address: "{{ hadoop_self_addr }}"
+      installed: "{{ hadoop_status_version.stdout | default('unknown') | trim }}"
+      expected_daemons: "{{ hadoop_host_daemons }}"
+      services: >-
+        {{ dict(hadoop_status_units.results | map(attribute='item') | list
+                | zip(hadoop_status_units.results | map(attribute='stdout') | map('default', 'unknown', true) | map('trim') | list)) }}
+      ports_open: >-
+        {{ dict(hadoop_status_ports.results | map(attribute='item') | list
+                | zip(hadoop_status_ports.results | map(attribute='failed') | map('default', false) | map('bool')
+                      | map('ternary', 'closed', 'open') | list)) }}
+      healthy: >-
+        {{ (hadoop_status_units.results | map(attribute='stdout') | map('default', '', true) | map('trim')
+            | reject('equalto', 'active') | list | length) == 0 }}
+      zookeeper: "{{ hadoop_status_zk.stdout | default('') | trim }}"
+      jps: "{{ hadoop_status_jps.stdout_lines | default([]) }}"
+      disk: "{{ hadoop_status_df.stdout_lines | default([]) }}"
+
+# The fixed "HADOOP_NODE_STATUS" key makes the block easy to find in the log.
+- name: Status | Node report
+  ansible.builtin.debug:
+    msg:
+      HADOOP_NODE_STATUS: "{{ hadoop_node_status }}"

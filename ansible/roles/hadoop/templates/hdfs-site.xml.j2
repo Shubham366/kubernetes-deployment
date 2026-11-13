@@ -1,0 +1,94 @@
+{#
+  hdfs-site.xml
+  Non-HA: one NameNode + SecondaryNameNode on the same host.
+  HA:     nameservice = cluster name, NameNodes nn1..nnN in inventory order
+          (hadoop_namenode first, then hadoop_standby_namenode), shared edits
+          on the JournalNode quorum, automatic failover through ZKFC.
+#}
+{% set ns = hadoop_cluster_name %}
+{% set nn_rpc = hadoop_ports.namenode_rpc %}
+{% set nn_http = hadoop_ports.namenode_http %}
+{% set props = {
+  'dfs.replication': hadoop_replication_factor | int,
+  'dfs.blocksize': hadoop_dfs_blocksize,
+  'dfs.namenode.name.dir': hadoop_nn_dirs | map('regex_replace', '^', 'file://') | join(','),
+  'dfs.datanode.data.dir': hadoop_dn_dirs | map('regex_replace', '^', 'file://') | join(','),
+  'dfs.permissions.enabled': hadoop_dfs_permissions_enabled | bool,
+  'dfs.permissions.superusergroup': hadoop_group,
+  'dfs.webhdfs.enabled': true,
+  'dfs.namenode.handler.count': hadoop_dfs_namenode_handler_count,
+  'dfs.datanode.max.transfer.threads': hadoop_dfs_datanode_max_transfer_threads,
+  'dfs.datanode.failed.volumes.tolerated': 0,
+  'dfs.hosts.exclude': hadoop_exclude_file,
+  'dfs.namenode.datanode.registration.ip-hostname-check': false,
+  'dfs.namenode.rpc-bind-host': '0.0.0.0',
+  'dfs.namenode.servicerpc-bind-host': '0.0.0.0',
+  'dfs.namenode.http-bind-host': '0.0.0.0',
+  'dfs.datanode.address': '0.0.0.0:' ~ hadoop_ports.datanode_data,
+  'dfs.datanode.http.address': '0.0.0.0:' ~ hadoop_ports.datanode_http,
+  'dfs.datanode.ipc.address': '0.0.0.0:' ~ hadoop_ports.datanode_ipc,
+  'dfs.client.use.datanode.hostname': true,
+  'dfs.datanode.use.datanode.hostname': true
+} %}
+{# Each DataNode registers under its cluster-wide name (see hadoop_node_map),
+   not under whatever `hostname` happens to return on the box. #}
+{% if inventory_hostname in hadoop_dn_hosts %}
+{%   set _ = props.update({'dfs.datanode.hostname': hadoop_self_addr}) %}
+{% endif %}
+{% if hadoop_ha | bool %}
+{#   ---- HA ---------------------------------------------------------------- #}
+{%   set nn_ids = [] %}
+{%   for h in hadoop_nn_hosts %}
+{%     set nn_id = 'nn' ~ loop.index %}
+{%     set _ = nn_ids.append(nn_id) %}
+{%     set _ = props.update({
+  'dfs.namenode.rpc-address.' ~ ns ~ '.' ~ nn_id: hadoop_node_map[h].name ~ ':' ~ nn_rpc,
+  'dfs.namenode.http-address.' ~ ns ~ '.' ~ nn_id: hadoop_node_map[h].name ~ ':' ~ nn_http
+}) %}
+{#     Tell each NameNode explicitly who it is; auto-detection by matching
+       local addresses fails behind NAT. #}
+{%     if h == inventory_hostname %}
+{%       set _ = props.update({'dfs.ha.namenode.id': nn_id}) %}
+{%     endif %}
+{%   endfor %}
+{#   sshfence logs into the old active and kills it; shell(/bin/true) lets the
+     failover proceed when that host is completely gone (QJM already
+     guarantees a single writer, so this is safe). #}
+{%   set _ = props.update({
+  'dfs.nameservices': ns,
+  'dfs.ha.namenodes.' ~ ns: nn_ids | join(','),
+  'dfs.namenode.shared.edits.dir': hadoop_qjournal_uri,
+  'dfs.journalnode.edits.dir': hadoop_journal_dir,
+  'dfs.journalnode.rpc-address': '0.0.0.0:' ~ hadoop_ports.journal_rpc,
+  'dfs.journalnode.http-address': '0.0.0.0:' ~ hadoop_ports.journal_http,
+  'dfs.client.failover.proxy.provider.' ~ ns: 'org.apache.hadoop.hdfs.server.namenode.ha.ConfiguredFailoverProxyProvider',
+  'dfs.ha.automatic-failover.enabled': true,
+  'dfs.ha.zkfc.port': hadoop_ports.zkfc,
+  'dfs.ha.fencing.methods': "sshfence\nshell(/bin/true)",
+  'dfs.ha.fencing.ssh.private-key-files': hadoop_ssh_key_file,
+  'dfs.ha.fencing.ssh.connect-timeout': 30000,
+  'dfs.namenode.edits.dir': hadoop_nn_dirs | map('regex_replace', '^', 'file://') | join(',')
+}) %}
+{% else %}
+{#   ---- single NameNode --------------------------------------------------- #}
+{%   set _ = props.update({
+  'dfs.namenode.rpc-address': hadoop_primary_nn_addr ~ ':' ~ nn_rpc,
+  'dfs.namenode.http-address': hadoop_primary_nn_addr ~ ':' ~ nn_http,
+  'dfs.namenode.secondary.http-address': hadoop_primary_nn_addr ~ ':' ~ hadoop_ports.secondary_http,
+  'dfs.namenode.checkpoint.dir': hadoop_checkpoint_dirs | map('regex_replace', '^', 'file://') | join(','),
+  'dfs.namenode.checkpoint.period': 3600
+}) %}
+{% endif %}
+{% set _ = props.update(hadoop_extra_hdfs_site | default({}, true)) %}
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<!-- {{ ansible_managed }} -->
+<!-- Generated for {{ inventory_hostname }} - cluster {{ hadoop_cluster_name }}. Local edits are overwritten. -->
+<configuration>
+{% for name, value in props | dictsort %}
+  <property>
+    <name>{{ name }}</name>
+    <value>{{ (value | string | lower) if value is boolean else (value | string | e) }}</value>
+  </property>
+{% endfor %}
+</configuration>

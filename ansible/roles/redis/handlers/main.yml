@@ -1,0 +1,21 @@
+---
+# Handlers run in the order they are listed here, so the daemon-reload always
+# happens before a restart that depends on a changed unit file.
+
+- name: Reload systemd for redis
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Restart redis
+  ansible.builtin.systemd:
+    name: "{{ __redis_service }}"
+    state: restarted
+    daemon_reload: true
+  when: __redis_is_data_node | bool
+
+- name: Restart redis sentinel
+  ansible.builtin.systemd:
+    name: "{{ __redis_sentinel_service }}"
+    state: restarted
+    daemon_reload: true
+  when: __redis_is_sentinel | bool

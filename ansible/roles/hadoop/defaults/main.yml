@@ -1,0 +1,279 @@
+---
+# =============================================================================
+# hadoop role - user-tunable defaults
+#
+# Everything in this file can be overridden with extra vars (-e) by the
+# provisioning backend. Derived / computed values live in vars/main.yml and
+# should normally not be overridden.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# What to do
+# -----------------------------------------------------------------------------
+# install | start | stop | restart | status | uninstall | scale_out | decommission
+hadoop_action: install
+
+# -----------------------------------------------------------------------------
+# Cluster identity / topology switches
+# -----------------------------------------------------------------------------
+hadoop_version: "3.3.6"
+# Used as the HDFS nameservice id (HA), YARN cluster-id and block-pool cluster id.
+# Must be a valid DNS-ish label: letters, digits and dashes only (no underscore).
+hadoop_cluster_name: hacluster
+# HA = 2+ NameNodes, QJM (JournalNodes), ZooKeeper + ZKFC automatic failover.
+hadoop_ha_enabled: false
+
+# -----------------------------------------------------------------------------
+# Users, directories
+# -----------------------------------------------------------------------------
+hadoop_user: hadoop
+hadoop_group: hadoop
+hadoop_user_home: "/home/{{ hadoop_user }}"
+hadoop_user_shell: /bin/bash
+
+# Layout:  <install_dir>/hadoop-<version>   (extracted distribution)
+#          <install_dir>/current            (symlink to the active version)
+#          <install_dir>/dist               (downloaded tarballs)
+hadoop_install_dir: /opt/hadoop
+hadoop_conf_dir: /etc/hadoop/conf
+hadoop_log_dir: /var/log/hadoop
+hadoop_pid_dir: /run/hadoop
+
+hadoop_replication_factor: 3
+# DataNode block storage (one entry per disk for JBOD setups).
+hadoop_data_dirs:
+  - /data/hadoop/dn
+# NameNode metadata directories (fsimage + edits). Multiple entries = redundant copies.
+hadoop_name_dirs:
+  - /data/hadoop/nn
+# JournalNode edits directory (HA only).
+hadoop_journal_dir: /data/hadoop/jn
+# SecondaryNameNode checkpoint directories (non-HA only).
+hadoop_checkpoint_dirs:
+  - /data/hadoop/snn
+hadoop_tmp_dir: /data/hadoop/tmp
+# NodeManager scratch space and container logs.
+hadoop_yarn_local_dirs:
+  - /data/hadoop/yarn/local
+hadoop_yarn_log_dirs:
+  - /data/hadoop/yarn/logs
+
+# -----------------------------------------------------------------------------
+# Download
+# -----------------------------------------------------------------------------
+hadoop_mirror: "https://archive.apache.org/dist"
+# Optional full URL override. Empty = build from hadoop_mirror + hadoop_version.
+hadoop_download_url: ""
+# Optional checksum, "sha512:<hex>" (a bare hex string is treated as sha512).
+# Empty = no verification (the Apache archive is fetched over HTTPS).
+hadoop_checksum: ""
+hadoop_download_timeout: 1800
+# Keep the tarball under <install_dir>/dist after extraction (speeds up re-installs).
+hadoop_keep_tarball: false
+
+# -----------------------------------------------------------------------------
+# Java
+# -----------------------------------------------------------------------------
+hadoop_java_version: 11
+# Set to an existing JDK path to skip the package installation entirely.
+hadoop_java_home: ""
+# Override the distro package name (default is derived from family + version).
+hadoop_java_package: ""
+
+# -----------------------------------------------------------------------------
+# JVM sizing
+# -----------------------------------------------------------------------------
+# Default max heap (MB) for every Hadoop daemon; per-daemon overrides below.
+hadoop_heap_size_mb: 1024
+hadoop_namenode_heap_mb: "{{ hadoop_heap_size_mb | default(1024, true) }}"
+hadoop_datanode_heap_mb: "{{ hadoop_heap_size_mb | default(1024, true) }}"
+hadoop_journalnode_heap_mb: 512
+hadoop_zkfc_heap_mb: 256
+hadoop_resourcemanager_heap_mb: "{{ hadoop_heap_size_mb | default(1024, true) }}"
+hadoop_nodemanager_heap_mb: "{{ hadoop_heap_size_mb | default(1024, true) }}"
+hadoop_historyserver_heap_mb: "{{ hadoop_heap_size_mb | default(1024, true) }}"
+# Extra JVM flags appended to HADOOP_OPTS for every daemon.
+hadoop_extra_java_opts: ""
+
+# -----------------------------------------------------------------------------
+# NameNode formatting
+# -----------------------------------------------------------------------------
+# Only honoured for hadoop_action=install, and only when NO NameNode in the
+# cluster holds formatted metadata yet (see tasks/namenode.yml). A formatted
+# NameNode is never reformatted, whatever this flag says.
+hadoop_format_namenode: true
+
+# -----------------------------------------------------------------------------
+# YARN
+# -----------------------------------------------------------------------------
+# 0 / unset = auto: 75% of the node's RAM (min 1024 MB) and all vCPUs.
+hadoop_yarn_nodemanager_memory_mb: 0
+hadoop_yarn_nodemanager_vcores: 0
+hadoop_yarn_scheduler_min_mb: 512
+hadoop_yarn_log_aggregation: true
+hadoop_yarn_remote_log_dir: /app-logs
+# MapReduce ApplicationMaster client port range (opened in the firewall on workers).
+hadoop_mapred_am_port_range: "50100-50200"
+
+# -----------------------------------------------------------------------------
+# Free-form additions merged over the generated *-site.xml properties
+# (the extra dict wins on key collisions).
+# -----------------------------------------------------------------------------
+hadoop_extra_core_site: {}
+hadoop_extra_hdfs_site: {}
+hadoop_extra_yarn_site: {}
+hadoop_extra_mapred_site: {}
+
+# -----------------------------------------------------------------------------
+# HDFS tunables
+# -----------------------------------------------------------------------------
+hadoop_dfs_blocksize: 134217728
+hadoop_dfs_namenode_handler_count: 32
+hadoop_dfs_datanode_max_transfer_threads: 4096
+hadoop_dfs_permissions_enabled: true
+hadoop_fs_trash_interval_minutes: 1440
+# HDFS directories created after the first successful start (path, mode).
+hadoop_hdfs_init_dirs:
+  - { path: /tmp, mode: "1777" }
+  - { path: /user, mode: "755" }
+  - { path: "/user/{{ hadoop_user }}", mode: "755" }
+  - { path: /mr-history, mode: "1777" }
+  - { path: /mr-history/tmp, mode: "1777" }
+  - { path: /mr-history/done, mode: "1777" }
+  - { path: "{{ hadoop_yarn_remote_log_dir }}", mode: "1777" }
+
+# -----------------------------------------------------------------------------
+# Ports (Hadoop 3 defaults)
+# -----------------------------------------------------------------------------
+hadoop_ports:
+  namenode_rpc: 8020
+  namenode_http: 9870
+  zkfc: 8019
+  secondary_http: 9868
+  journal_rpc: 8485
+  journal_http: 8480
+  datanode_data: 9866
+  datanode_http: 9864
+  datanode_ipc: 9867
+  rm_scheduler: 8030
+  rm_tracker: 8031
+  rm_client: 8032
+  rm_admin: 8033
+  rm_web: 8088
+  nm_localizer: 8040
+  nm_ipc: 8041
+  nm_web: 8042
+  shuffle: 13562
+  jhs_rpc: 10020
+  jhs_web: 19888
+  jhs_admin: 10033
+  zk_client: 2181
+  zk_peer: 2888
+  zk_election: 3888
+
+# -----------------------------------------------------------------------------
+# ZooKeeper (installed on the hadoop_zookeeper group; required for HA)
+# -----------------------------------------------------------------------------
+hadoop_zookeeper_version: "3.8.4"
+hadoop_zookeeper_download_url: ""
+hadoop_zookeeper_checksum: ""
+hadoop_zookeeper_user: zookeeper
+hadoop_zookeeper_group: zookeeper
+hadoop_zookeeper_install_dir: /opt/zookeeper
+hadoop_zookeeper_conf_dir: /etc/zookeeper/conf
+hadoop_zookeeper_data_dir: /data/zookeeper
+hadoop_zookeeper_log_dir: /var/log/zookeeper
+hadoop_zookeeper_heap_mb: 512
+hadoop_zookeeper_tick_time: 2000
+hadoop_zookeeper_init_limit: 10
+hadoop_zookeeper_sync_limit: 5
+hadoop_zookeeper_max_client_cnxns: 300
+hadoop_zookeeper_autopurge_retain: 5
+hadoop_zookeeper_autopurge_interval_hours: 24
+# znode under which the HA election state lives.
+hadoop_ha_zk_parent_znode: /hadoop-ha
+
+# -----------------------------------------------------------------------------
+# Scale out / decommission
+# -----------------------------------------------------------------------------
+# Inventory hostnames (must already be members of hadoop_datanode).
+hadoop_new_nodes: []
+hadoop_decommission_nodes: []
+# Kick off "hdfs balancer" in the background after a scale out.
+hadoop_run_balancer_after_scale_out: false
+hadoop_balancer_threshold: 10
+# How long to wait for HDFS block re-replication / YARN container drain.
+hadoop_decommission_timeout: 7200
+hadoop_decommission_poll_interval: 30
+# Refuse to decommission when fewer live DataNodes than the replication factor
+# would remain (the decommission could then never complete).
+hadoop_decommission_force: false
+# Stop and disable the daemons on a node once it has been decommissioned.
+hadoop_decommission_stop_services: true
+
+# -----------------------------------------------------------------------------
+# Uninstall
+# -----------------------------------------------------------------------------
+# false = keep HDFS data, NameNode metadata, JournalNode edits and ZooKeeper data.
+hadoop_purge_data: false
+# Remove the service accounts (defaults to following hadoop_purge_data).
+hadoop_remove_user: "{{ hadoop_purge_data | default(false) }}"
+hadoop_remove_logs: true
+
+# -----------------------------------------------------------------------------
+# OS preparation toggles
+# -----------------------------------------------------------------------------
+hadoop_manage_etc_hosts: true
+# Drop Debian/Ubuntu's "127.0.1.1 <hostname>" line: a NameNode/DataNode that
+# resolves its own name to loopback binds to 127.0.1.1 and is unreachable.
+hadoop_fix_loopback_hostname: true
+hadoop_manage_firewall: true
+# firewalld zone to open ports in ("" = the default zone).
+hadoop_firewalld_zone: ""
+# Restrict the opened ports to these source addresses / CIDRs. Empty = any source.
+hadoop_firewall_allowed_sources: []
+hadoop_manage_ssh: true
+hadoop_manage_sysctl: true
+hadoop_sysctl_settings:
+  vm.swappiness: 1
+  vm.overcommit_memory: 1
+  net.core.somaxconn: 4096
+  net.ipv4.tcp_max_syn_backlog: 8192
+  net.ipv4.ip_local_port_range: "32768 60999"
+  fs.file-max: 6815744
+hadoop_nofile_limit: 131072
+hadoop_nproc_limit: 65536
+# Swapping JVM heaps kills HDFS latency. swappiness=1 is always applied through
+# sysctl; set this to true to additionally swapoff and comment out fstab entries.
+hadoop_disable_swap: false
+# Transparent Huge Pages cause long GC pauses / CPU stalls; disabled via a oneshot unit.
+hadoop_disable_thp: true
+hadoop_install_chrony: true
+# keep | permissive | disabled | enforcing  (RedHat family only).
+# "keep" leaves SELinux alone and only restores file contexts on the install tree.
+hadoop_selinux_state: keep
+
+# -----------------------------------------------------------------------------
+# Preflight thresholds
+# -----------------------------------------------------------------------------
+# false = report resource shortfalls as warnings instead of failing the run.
+hadoop_preflight_enforce: true
+hadoop_min_memory_mb: 1800
+hadoop_min_install_free_mb: 3000
+hadoop_min_data_free_mb: 5000
+
+# -----------------------------------------------------------------------------
+# Service control
+# -----------------------------------------------------------------------------
+hadoop_service_start_timeout: 180
+# When re-running "install" against a live cluster, restart daemons whose
+# configuration changed (NameNodes / ResourceManagers one at a time).
+hadoop_restart_on_config_change: true
+# hadoop_action=restart: number (or percentage) of workers restarted per batch.
+hadoop_rolling_batch: 1
+# Seconds to pause after each restarted host during a rolling restart.
+hadoop_rolling_restart_pause: 10
+# Also bounce the ZooKeeper ensemble on hadoop_action=restart.
+hadoop_restart_zookeeper: false
+hadoop_safemode_wait_retries: 60
+hadoop_safemode_wait_delay: 10

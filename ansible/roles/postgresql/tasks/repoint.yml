@@ -1,0 +1,84 @@
+---
+# promote, step 3 (optional, postgresql_promote_repoint_replicas=true):
+# make a remaining standby follow the newly promoted primary.
+#
+# The standby keeps its data; it only gets a new primary_conninfo. PostgreSQL
+# 12+ follows the new timeline automatically (recovery_target_timeline =
+# 'latest'). This only works when the standby has not replayed WAL that the
+# promoted node never received; otherwise it fails to connect with a timeline
+# error and has to be rebuilt (add_replica + postgresql_force_resync=true).
+
+- name: Repoint | load variables
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Repoint | new primary address
+  ansible.builtin.set_fact:
+    __pg_new_primary_addr: "{{ hostvars[postgresql_promote_host].ansible_host | default(postgresql_promote_host) }}"
+
+- name: Repoint | this node must be a standby
+  ansible.builtin.command: "{{ __pg_psql }}"
+  args:
+    stdin: "SELECT pg_is_in_recovery();"
+  become: true
+  become_user: postgres
+  register: __pg_repoint_recovery
+  changed_when: false
+  failed_when: __pg_repoint_recovery.rc != 0 or (__pg_repoint_recovery.stdout | trim) != 't'
+
+# Refresh ~postgres/.pgpass only when the password was passed to this run;
+# the file written at install time (host "*") is valid for the new primary too.
+- name: Repoint | .pgpass for the replication user
+  ansible.builtin.copy:
+    dest: "{{ __pg_pgpass_file }}"
+    owner: postgres
+    group: postgres
+    mode: "0600"
+    content: |
+      # Managed by Ansible (postgresql role)
+      *:{{ postgresql_port }}:replication:{{ postgresql_replication_user }}:{{ __pg_pgpass_password }}
+      *:{{ postgresql_port }}:postgres:{{ postgresql_replication_user }}:{{ __pg_pgpass_password }}
+  diff: false
+  no_log: true
+  when: postgresql_replication_password | string | length > 0
+
+# No password in primary_conninfo: it is read from the passfile.
+- name: Repoint | point primary_conninfo at {{ __pg_new_primary_addr }}
+  ansible.builtin.command: "{{ __pg_psql }}"
+  args:
+    stdin: |
+      ALTER SYSTEM SET primary_conninfo = 'host={{ __pg_new_primary_addr }} port={{ postgresql_port }} user={{ postgresql_replication_user }} passfile={{ __pg_pgpass_file }} application_name={{ __pg_node_name }}';
+      ALTER SYSTEM SET primary_slot_name = '{{ __pg_slot_name }}';
+  become: true
+  become_user: postgres
+  changed_when: true
+
+# primary_conninfo is reloadable from PostgreSQL 13 on; a restart works for
+# every supported version and also drops the connection to the old primary.
+- name: Repoint | restart the standby
+  ansible.builtin.systemd:
+    name: "{{ __pg_service }}"
+    state: restarted
+
+- name: Repoint | wait until the server accepts connections
+  ansible.builtin.command: "{{ __pg_bin_dir }}/pg_isready -h {{ __pg_socket_dir }} -p {{ postgresql_port }}"
+  register: __pg_repoint_ready
+  changed_when: false
+  retries: 60
+  delay: 2
+  until: __pg_repoint_ready.rc == 0
+
+- name: Repoint | wait until it streams from the new primary
+  ansible.builtin.command: "{{ __pg_psql }}"
+  args:
+    stdin: "SELECT coalesce((SELECT status || '|' || sender_host FROM pg_stat_wal_receiver LIMIT 1), 'none');"
+  become: true
+  become_user: postgres
+  register: __pg_repoint_stream
+  changed_when: false
+  retries: 30
+  delay: 3
+  until: (__pg_repoint_stream.stdout | default('') | trim) is match('^streaming\|')
+
+- name: Repoint | result
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} now follows {{ postgresql_promote_host }} ({{ __pg_repoint_stream.stdout | trim }})"

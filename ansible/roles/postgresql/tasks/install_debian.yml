@@ -1,0 +1,84 @@
+---
+# Debian / Ubuntu: PGDG apt repository + postgresql-<ver>.
+
+- name: Debian | prerequisites
+  ansible.builtin.apt:
+    name: "{{ __pg_os_prereq_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  register: __pg_apt_prereq
+  retries: 3
+  delay: 10
+  until: __pg_apt_prereq is succeeded
+
+# By default installing postgresql-<ver> immediately creates AND starts a
+# "main" cluster with default settings (port 5432, default data dir). We
+# want to create it ourselves (custom port / data dir / initdb options, and
+# no cluster at all on replicas that will be base-backed-up), so switch the
+# auto-creation off before the server package is installed.
+- name: Debian | do not auto-create the main cluster on package install
+  ansible.builtin.lineinfile:
+    path: /etc/postgresql-common/createcluster.conf
+    regexp: '^\s*#?\s*create_main_cluster\s*='
+    line: "create_main_cluster = false"
+    create: true
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Debian | PGDG repository
+  when: postgresql_use_pgdg_repo | bool
+  block:
+    - name: Debian | keyring directory
+      ansible.builtin.file:
+        path: /usr/share/postgresql-common/pgdg
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    # ASCII-armoured key referenced with signed-by (apt-key is deprecated).
+    - name: Debian | PGDG signing key
+      ansible.builtin.get_url:
+        url: "{{ postgresql_apt_key_url }}"
+        dest: /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+        owner: root
+        group: root
+        mode: "0644"
+      register: __pg_apt_key
+      retries: 3
+      delay: 10
+      until: __pg_apt_key is succeeded
+
+    # <codename>-pgdg, e.g. jammy-pgdg / bookworm-pgdg. Releases that PGDG no
+    # longer serves (EOL) live on apt-archive.postgresql.org: override
+    # postgresql_apt_repo_url for those.
+    - name: Debian | PGDG apt source
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/pgdg.list
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by Ansible (postgresql role)
+          deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] {{ postgresql_apt_repo_url }} {{ ansible_distribution_release }}-pgdg main
+      register: __pg_apt_source
+
+    - name: Debian | refresh apt cache after adding the repository
+      ansible.builtin.apt:
+        update_cache: true
+      register: __pg_apt_update
+      retries: 3
+      delay: 10
+      until: __pg_apt_update is succeeded
+      when: __pg_apt_source is changed or __pg_apt_key is changed
+
+- name: Debian | install PostgreSQL {{ __pg_version }}
+  ansible.builtin.apt:
+    name: "{{ __pg_os_packages }}"
+    state: present
+  register: __pg_apt_install
+  retries: 3
+  delay: 10
+  until: __pg_apt_install is succeeded

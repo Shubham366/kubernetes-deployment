@@ -1,0 +1,52 @@
+---
+# Joins ONE new node (loop var: __redis_new_node) to the cluster.
+# Everything is executed on the seed node and talks to the new node over the
+# network, so no delegation is needed.
+
+- name: "Scale out | {{ __redis_new_node }} | endpoint"
+  ansible.builtin.set_fact:
+    __redis_new_endpoint: "{{ __redis_node_ips[__redis_new_node] }}:{{ redis_port }}"
+
+- name: "Scale out | {{ __redis_new_node }} | reachable from the seed"
+  ansible.builtin.wait_for:
+    host: "{{ __redis_node_ips[__redis_new_node] }}"
+    port: "{{ item }}"
+    timeout: 60
+  loop:
+    - "{{ redis_port | int }}"
+    - "{{ (redis_port | int) + 10000 }}"
+
+# An unjoined node only knows itself. >1 known nodes = already a member.
+- name: "Scale out | {{ __redis_new_node }} | already a cluster member?"
+  ansible.builtin.command: >-
+    {{ __redis_cli_bin }} -h {{ __redis_node_ips[__redis_new_node] }} -p {{ redis_port }} cluster info
+  environment: "{{ __redis_cli_env }}"
+  register: __redis_new_info
+  changed_when: false
+
+- name: "Scale out | {{ __redis_new_node }} | add-node"
+  ansible.builtin.command: >-
+    {{ __redis_cli_bin }} --cluster add-node {{ __redis_new_endpoint }} {{ __redis_seed_endpoint }}
+    {{ '--cluster-slave' if redis_scale_out_as_replica | bool else '' }}
+  environment: "{{ __redis_cli_env }}"
+  register: __redis_add_node
+  changed_when: true
+  # the previous add-node may still be propagating through gossip
+  retries: 5
+  delay: 5
+  until: __redis_add_node.rc == 0
+  when: (__redis_new_info.stdout | regex_findall('cluster_known_nodes:([0-9]+)') | first | default('0') | int) <= 1
+
+# Wait until the newcomer has learned about the whole cluster before the next
+# add-node / the rebalance.
+- name: "Scale out | {{ __redis_new_node }} | wait until it has joined"
+  ansible.builtin.command: >-
+    {{ __redis_cli_bin }} -h {{ __redis_node_ips[__redis_new_node] }} -p {{ redis_port }} cluster info
+  environment: "{{ __redis_cli_env }}"
+  register: __redis_new_joined
+  changed_when: false
+  retries: "{{ redis_wait_retries | int }}"
+  delay: "{{ redis_wait_delay | int }}"
+  until: >-
+    (__redis_new_joined.stdout | regex_findall('cluster_known_nodes:([0-9]+)') | first | default('0') | int)
+    >= (__redis_cluster_existing | length) + 1

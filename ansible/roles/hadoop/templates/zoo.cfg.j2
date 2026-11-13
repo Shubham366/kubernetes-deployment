@@ -1,0 +1,28 @@
+# {{ ansible_managed }}
+# ZooKeeper ensemble for Hadoop cluster {{ hadoop_cluster_name }}
+tickTime={{ hadoop_zookeeper_tick_time }}
+initLimit={{ hadoop_zookeeper_init_limit }}
+syncLimit={{ hadoop_zookeeper_sync_limit }}
+dataDir={{ hadoop_zookeeper_data_dir }}
+clientPort={{ hadoop_ports.zk_client }}
+maxClientCnxns={{ hadoop_zookeeper_max_client_cnxns }}
+
+# Old snapshots / transaction logs are never removed unless autopurge is on.
+autopurge.snapRetainCount={{ hadoop_zookeeper_autopurge_retain }}
+autopurge.purgeInterval={{ hadoop_zookeeper_autopurge_interval_hours }}
+
+# The embedded Jetty admin server defaults to port 8080, which collides with
+# plenty of other software; the four-letter words below are enough for us.
+admin.enableServer=false
+4lw.commands.whitelist=srvr,stat,ruok,mntr,conf
+
+{% if hadoop_zk_hosts | length > 1 %}
+# Ensemble members: server.<myid>=<host>:<peer port>:<election port>
+# Listen on all interfaces so members behind NAT / with multiple NICs can bind.
+quorumListenOnAllIPs=true
+{%   for h in hadoop_zk_hosts %}
+server.{{ hostvars[h].hadoop_zookeeper_myid | default(loop.index) }}={{ hadoop_node_map[h].name }}:{{ hadoop_ports.zk_peer }}:{{ hadoop_ports.zk_election }}
+{%   endfor %}
+{% else %}
+# Single server: standalone mode (no server.N lines).
+{% endif %}

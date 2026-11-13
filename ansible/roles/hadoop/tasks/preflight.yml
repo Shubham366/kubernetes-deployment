@@ -1,0 +1,314 @@
+---
+# =============================================================================
+# Preflight - run before install / scale_out. Nothing is changed here.
+#
+#  1. topology (group sizes, quorum shapes)        -> once per run
+#  2. operating system / platform                  -> per host
+#  3. resources (memory, disk)                     -> per host
+#
+# Resource checks honour hadoop_preflight_enforce (false = warn only);
+# topology and OS checks are always fatal.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# 1. Topology
+# ---------------------------------------------------------------------------
+- name: Preflight | Show the resolved topology
+  ansible.builtin.debug:
+    msg:
+      action: "{{ hadoop_action }}"
+      cluster: "{{ hadoop_cluster_name }}"
+      version: "{{ hadoop_version }}"
+      ha_enabled: "{{ hadoop_ha | bool }}"
+      resourcemanager_ha: "{{ hadoop_rm_ha | bool }}"
+      namenodes: "{{ hadoop_nn_hosts }}"
+      journalnodes: "{{ hadoop_jn_hosts }}"
+      zookeepers: "{{ hadoop_zk_hosts }}"
+      resourcemanagers: "{{ hadoop_rm_hosts }}"
+      workers: "{{ hadoop_dn_hosts }}"
+      historyservers: "{{ hadoop_jhs_hosts }}"
+      default_fs: "{{ hadoop_default_fs }}"
+  run_once: true
+
+- name: Preflight | At least one DataNode is declared
+  ansible.builtin.assert:
+    that:
+      - hadoop_dn_hosts | length >= 1
+    fail_msg: "Inventory group 'hadoop_datanode' is empty - HDFS needs at least one DataNode."
+    quiet: true
+  run_once: true
+
+- name: Preflight | Non-HA topology
+  ansible.builtin.assert:
+    that:
+      - hadoop_nn_hosts | length == 1
+    fail_msg: >-
+      hadoop_ha_enabled=false but {{ hadoop_nn_hosts | length }} NameNode hosts are
+      declared ({{ hadoop_nn_hosts | join(', ') }}). A non-HA cluster has exactly
+      one NameNode (the SecondaryNameNode is co-located on it). Either enable HA
+      or empty the 'hadoop_standby_namenode' group.
+    quiet: true
+  run_once: true
+  when: not (hadoop_ha | bool)
+
+- name: Preflight | HA topology - NameNodes
+  ansible.builtin.assert:
+    that:
+      - hadoop_nn_hosts | length >= 2
+      - hadoop_nn_hosts | length <= 5
+    fail_msg: >-
+      hadoop_ha_enabled=true needs 2 NameNodes (hadoop_namenode +
+      hadoop_standby_namenode; up to 5 are supported by Hadoop 3), found
+      {{ hadoop_nn_hosts | length }}.
+    quiet: true
+  run_once: true
+  when: hadoop_ha | bool
+
+- name: Preflight | HA topology - JournalNodes (odd, >= 3)
+  ansible.builtin.assert:
+    that:
+      - hadoop_jn_hosts | length >= 3
+      - (hadoop_jn_hosts | length) % 2 == 1
+    fail_msg: >-
+      HA with the Quorum Journal Manager needs an odd number (>= 3) of
+      JournalNodes so that a majority survives a node failure; the
+      'hadoop_journalnode' group has {{ hadoop_jn_hosts | length }}.
+    quiet: true
+  run_once: true
+  when: hadoop_ha | bool
+
+- name: Preflight | HA topology - ZooKeeper ensemble (odd, >= 1)
+  ansible.builtin.assert:
+    that:
+      - hadoop_zk_hosts | length >= 1
+      - (hadoop_zk_hosts | length) % 2 == 1
+    fail_msg: >-
+      Automatic NameNode failover needs a ZooKeeper ensemble with an odd number
+      of members; the 'hadoop_zookeeper' group has {{ hadoop_zk_hosts | length }}.
+    quiet: true
+  run_once: true
+  when: hadoop_ha | bool
+
+- name: Preflight | Warn about a single-node ZooKeeper "ensemble"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: only one ZooKeeper server is declared. Failover coordination
+      itself is then a single point of failure - use 3 or 5 in production.
+  run_once: true
+  when:
+    - hadoop_ha | bool
+    - hadoop_zk_hosts | length == 1
+
+- name: Preflight | ZooKeeper ensemble without HA must still be odd
+  ansible.builtin.assert:
+    that:
+      - (hadoop_zk_hosts | length) % 2 == 1
+    fail_msg: "The 'hadoop_zookeeper' group has {{ hadoop_zk_hosts | length }} members; use an odd number."
+    quiet: true
+  run_once: true
+  when:
+    - not (hadoop_ha | bool)
+    - hadoop_zk_hosts | length > 0
+
+- name: Preflight | ResourceManager topology
+  ansible.builtin.assert:
+    that:
+      - hadoop_rm_hosts | length <= 1 or hadoop_zk_hosts | length > 0
+      - hadoop_rm_hosts | length <= 4
+    fail_msg: >-
+      {{ hadoop_rm_hosts | length }} ResourceManagers are declared. More than one
+      means ResourceManager HA, which needs the 'hadoop_zookeeper' group for
+      leader election and the state store (currently
+      {{ hadoop_zk_hosts | length }} members).
+    quiet: true
+  run_once: true
+
+- name: Preflight | Note when YARN is not deployed
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: 'hadoop_resourcemanager' is empty - only HDFS will be deployed
+      (no ResourceManager, NodeManagers or JobHistory server).
+  run_once: true
+  when: not (hadoop_yarn_enabled | bool)
+
+- name: Preflight | History server needs YARN
+  ansible.builtin.assert:
+    that:
+      - hadoop_jhs_hosts | length == 0 or hadoop_yarn_enabled | bool
+      - hadoop_jhs_hosts | length <= 1
+    fail_msg: >-
+      'hadoop_historyserver' must contain at most one host and requires a
+      ResourceManager to be declared.
+    quiet: true
+  run_once: true
+
+- name: Preflight | Warn when the replication factor exceeds the DataNode count
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: hadoop_replication_factor={{ hadoop_replication_factor }} but only
+      {{ hadoop_dn_hosts | length }} DataNode(s) are declared. HDFS will work but
+      every block will be reported as under-replicated.
+  run_once: true
+  when: (hadoop_replication_factor | int) > (hadoop_dn_hosts | length)
+
+- name: Preflight | Node names used inside the cluster must be unique
+  ansible.builtin.assert:
+    that:
+      - (hadoop_node_map.values() | map(attribute='name') | list | unique | length) == (hadoop_all_hosts | length)
+    fail_msg: >-
+      Two inventory hosts resolve to the same cluster-internal name/address:
+      {{ hadoop_node_map }}. Check ansible_host / hadoop_node_ip for duplicates.
+    quiet: true
+  run_once: true
+
+# ---------------------------------------------------------------------------
+# 2. Operating system
+# ---------------------------------------------------------------------------
+- name: Preflight | Supported OS family
+  ansible.builtin.assert:
+    that:
+      - ansible_os_family in hadoop_supported_os_families
+    fail_msg: >-
+      {{ inventory_hostname }}: unsupported OS family '{{ ansible_os_family }}'
+      ({{ ansible_distribution }} {{ ansible_distribution_version }}). Supported:
+      Debian family (Ubuntu 20.04/22.04/24.04, Debian 11/12) and RedHat family
+      (RHEL / CentOS / Stream / Rocky / AlmaLinux 7, 8, 9).
+    quiet: true
+
+- name: Preflight | Supported distribution release
+  ansible.builtin.assert:
+    that:
+      - >-
+        (ansible_distribution == 'Ubuntu' and ansible_distribution_version is version('20.04', '>='))
+        or (ansible_distribution == 'Debian' and (ansible_distribution_major_version | int) >= 10)
+        or (ansible_os_family == 'RedHat' and (ansible_distribution_major_version | int) >= 7)
+        or (ansible_os_family == 'Debian' and ansible_distribution not in ['Ubuntu', 'Debian'])
+    fail_msg: >-
+      {{ inventory_hostname }}: {{ ansible_distribution }} {{ ansible_distribution_version }}
+      is too old. Minimum: Ubuntu 20.04, Debian 10, EL 7.
+    quiet: true
+
+- name: Preflight | Warn when the declared OS does not look like the detected one
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: inventory says declared_os='{{ declared_os }}' but the host reports
+      {{ ansible_distribution }} {{ ansible_distribution_version }}
+      ({{ ansible_os_family }} family). The detected OS is used.
+  when:
+    - declared_os is defined
+    - declared_os | string | length > 0
+    - (ansible_distribution | lower) not in (declared_os | string | lower)
+    - (ansible_os_family | lower) not in (declared_os | string | lower)
+    # "rhel", "centos", "rocky", "alma" ... all mean RedHat family
+    - not (ansible_os_family == 'RedHat'
+           and (declared_os | string | lower) is search('rhel|red ?hat|centos|rocky|alma|oracle|fedora|amazon'))
+
+- name: Preflight | systemd is the init system
+  ansible.builtin.assert:
+    that:
+      - ansible_service_mgr == 'systemd'
+    fail_msg: >-
+      {{ inventory_hostname }}: service manager is '{{ ansible_service_mgr }}'.
+      The daemons are managed as systemd units; other init systems (and most
+      containers without systemd) are not supported.
+    quiet: true
+
+- name: Preflight | CPU architecture
+  ansible.builtin.assert:
+    that:
+      - ansible_architecture in ['x86_64', 'aarch64']
+      - ansible_architecture == 'x86_64' or hadoop_version is version('3.3.1', '>=') or (hadoop_download_url | default('', true) | length > 0)
+    fail_msg: >-
+      {{ inventory_hostname }}: architecture '{{ ansible_architecture }}' is not
+      supported by the Apache binary release of Hadoop {{ hadoop_version }}
+      (aarch64 tarballs exist from 3.3.1; otherwise pass hadoop_download_url).
+    quiet: true
+
+- name: Preflight | Java availability hints for this distribution
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ ansible_distribution }} {{ ansible_distribution_major_version }} does not
+      ship OpenJDK {{ hadoop_java_version }} in its standard repositories. The JDK
+      install will fail unless an extra repository provides
+      '{{ hadoop_java_effective_package }}'; alternatively set hadoop_java_home to
+      a pre-installed JDK or choose another hadoop_java_version.
+  when:
+    - (hadoop_java_home | default('', true) | length) == 0
+    - >-
+      (ansible_distribution == 'Debian' and (ansible_distribution_major_version | int) >= 12 and (hadoop_java_version | int) in [8, 11])
+      or (ansible_distribution == 'Debian' and (ansible_distribution_major_version | int) == 11 and (hadoop_java_version | int) in [8, 21])
+      or (ansible_distribution == 'Ubuntu' and ansible_distribution_version is version('22.04', '<') and (hadoop_java_version | int) == 21)
+      or (ansible_os_family == 'RedHat' and (ansible_distribution_major_version | int) == 7 and (hadoop_java_version | int) >= 17)
+
+# ---------------------------------------------------------------------------
+# 3. Resources
+# ---------------------------------------------------------------------------
+- name: Preflight | Memory
+  ansible.builtin.assert:
+    that:
+      - (ansible_memtotal_mb | int) >= (hadoop_min_memory_mb | int)
+    fail_msg: >-
+      {{ inventory_hostname }}: {{ ansible_memtotal_mb }} MB RAM, below the minimum
+      of {{ hadoop_min_memory_mb }} MB (override with hadoop_min_memory_mb or set
+      hadoop_preflight_enforce=false).
+    success_msg: "{{ inventory_hostname }}: {{ ansible_memtotal_mb }} MB RAM"
+  ignore_errors: "{{ not (hadoop_preflight_enforce | bool) }}"
+  when: hadoop_node_selected | bool
+
+- name: Preflight | Heap sizes fit into RAM
+  ansible.builtin.assert:
+    that:
+      - (hadoop_heap_size_mb | default(1024, true) | int) >= 256
+      - (hadoop_heap_size_mb | default(1024, true) | int) < (ansible_memtotal_mb | int)
+    fail_msg: >-
+      {{ inventory_hostname }}: hadoop_heap_size_mb={{ hadoop_heap_size_mb }} must be
+      >= 256 and smaller than the node's RAM ({{ ansible_memtotal_mb }} MB).
+    quiet: true
+  ignore_errors: "{{ not (hadoop_preflight_enforce | bool) }}"
+  when: hadoop_node_selected | bool
+
+# df is asked about the nearest *existing* parent, because the directories
+# themselves usually do not exist yet on a first install.
+- name: Preflight | Free space under the install and data directories
+  ansible.builtin.shell: |
+    p={{ item | quote }}
+    while [ ! -e "$p" ] && [ "$p" != "/" ]; do p=$(dirname "$p"); done
+    df -Pm "$p" | awk 'NR==2 {print $4}'
+  args:
+    executable: /bin/sh
+  loop: "{{ ([hadoop_install_dir] + hadoop_host_storage_dirs) | unique | list }}"
+  register: hadoop_preflight_df
+  changed_when: false
+  check_mode: false
+  when: hadoop_node_selected | bool
+
+- name: Preflight | Enough free disk space
+  ansible.builtin.assert:
+    that:
+      - (item.stdout | default('0', true) | int) >= (hadoop_min_install_free_mb if item.item == hadoop_install_dir else hadoop_min_data_free_mb) | int
+    fail_msg: >-
+      {{ inventory_hostname }}: only {{ item.stdout | default('?') }} MB free for {{ item.item }}
+      (need {{ hadoop_min_install_free_mb if item.item == hadoop_install_dir else hadoop_min_data_free_mb }} MB).
+      Override with hadoop_min_install_free_mb / hadoop_min_data_free_mb or set
+      hadoop_preflight_enforce=false.
+    quiet: true
+  loop: "{{ hadoop_preflight_df.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('') }}"
+  ignore_errors: "{{ not (hadoop_preflight_enforce | bool) }}"
+  when:
+    - hadoop_node_selected | bool
+    - item.stdout is defined
+    # An already installed tree does not need room for another download.
+    - not (hadoop_action == 'scale_out' and inventory_hostname not in hadoop_new_node_list)
+
+- name: Preflight | Warn about active swap
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: {{ inventory_hostname }} has {{ ansible_swaptotal_mb }} MB of swap.
+      vm.swappiness will be set to 1; pass hadoop_disable_swap=true to turn swap
+      off completely.
+  when:
+    - hadoop_node_selected | bool
+    - (ansible_swaptotal_mb | default(0) | int) > 0
+    - not (hadoop_disable_swap | bool)

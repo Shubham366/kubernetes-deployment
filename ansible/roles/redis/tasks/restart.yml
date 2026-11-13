@@ -1,0 +1,103 @@
+---
+# Rolling restart of ONE data node. The playbook calls this twice over all
+# data nodes with serial: 1:
+#
+#   pass "replicas": restart the node only if it is a replica RIGHT NOW
+#   pass "masters" : restart every node that pass 1 did not touch
+#
+# The runtime role is used instead of the inventory group because sentinel or
+# cluster failovers move the master role around. After each restart we wait
+# until the node is healthy again (replica link up / cluster ok) before the
+# play moves on to the next host; a node that does not come back fails its
+# batch of one, which aborts the play and leaves the remaining nodes alone.
+#
+# Input: redis_restart_pass = replicas | masters
+
+- name: Restart | load variables
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Restart | current role
+  ansible.builtin.command: "{{ __redis_cli }} info replication"
+  environment: "{{ __redis_cli_env }}"
+  register: __redis_role_probe
+  changed_when: false
+  failed_when: false
+
+- name: Restart | classify node
+  ansible.builtin.set_fact:
+    # "down": redis is not answering; restarting it early can only help
+    __redis_runtime_role: >-
+      {{ 'slave' if 'role:slave' in (__redis_role_probe.stdout | default(''))
+         else ('master' if 'role:master' in (__redis_role_probe.stdout | default('')) else 'down') }}
+
+- name: Restart | decide
+  ansible.builtin.set_fact:
+    __redis_do_restart: >-
+      {{ not (__redis_restarted | default(false) | bool)
+         and (redis_restart_pass | default('masters') == 'masters' or __redis_runtime_role != 'master') }}
+
+- name: Restart | plan
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: pass={{ redis_restart_pass | default('masters') }},
+      runtime role={{ __redis_runtime_role }},
+      {{ 'restarting now' if __redis_do_restart | bool
+         else ('already restarted in pass 1' if __redis_restarted | default(false) | bool else 'master: left for pass 2') }}
+
+- name: Restart | restart and wait for health
+  when: __redis_do_restart | bool
+  block:
+    - name: Restart | restart {{ __redis_service }}
+      ansible.builtin.systemd:
+        name: "{{ __redis_service }}"
+        state: restarted
+        daemon_reload: true
+
+    - name: Restart | wait for the port
+      ansible.builtin.wait_for:
+        host: "{{ __redis_cli_host }}"
+        port: "{{ redis_port | int }}"
+        timeout: 300
+
+    - name: Restart | wait for PING (dataset loaded)
+      ansible.builtin.command: "{{ __redis_cli }} ping"
+      environment: "{{ __redis_cli_env }}"
+      register: __redis_restart_ping
+      changed_when: false
+      retries: "{{ redis_wait_retries | int }}"
+      delay: "{{ redis_wait_delay | int }}"
+      until: "'PONG' in __redis_restart_ping.stdout"
+
+    - name: Restart | role after restart
+      ansible.builtin.command: "{{ __redis_cli }} info replication"
+      environment: "{{ __redis_cli_env }}"
+      register: __redis_role_after
+      changed_when: false
+
+    # Do not move on to the next node while this replica is still resyncing:
+    # restarting the master (or the next replica) now would reduce redundancy.
+    - name: Restart | wait for the replica to be in sync again
+      ansible.builtin.command: "{{ __redis_cli }} info replication"
+      environment: "{{ __redis_cli_env }}"
+      register: __redis_resync
+      changed_when: false
+      retries: "{{ redis_wait_retries | int }}"
+      delay: "{{ redis_wait_delay | int }}"
+      until:
+        - "'master_link_status:up' in __redis_resync.stdout"
+        - "'master_sync_in_progress:0' in __redis_resync.stdout"
+      when: "'role:slave' in __redis_role_after.stdout"
+
+    - name: Restart | wait for cluster_state:ok
+      ansible.builtin.command: "{{ __redis_cli }} cluster info"
+      environment: "{{ __redis_cli_env }}"
+      register: __redis_restart_cluster
+      changed_when: false
+      retries: "{{ redis_wait_retries | int }}"
+      delay: "{{ redis_wait_delay | int }}"
+      until: "'cluster_state:ok' in __redis_restart_cluster.stdout"
+      when: redis_mode == 'cluster'
+
+    - name: Restart | remember this node is done
+      ansible.builtin.set_fact:
+        __redis_restarted: true

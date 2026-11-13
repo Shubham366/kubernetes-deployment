@@ -1,0 +1,39 @@
+{#
+  mapred-site.xml
+  MapReduce on YARN. HADOOP_MAPRED_HOME is passed to the AM and the tasks
+  explicitly - without it Hadoop 3 jobs die with
+  "Could not find or load main class ...MRAppMaster".
+#}
+{% set mr_home = 'HADOOP_MAPRED_HOME=' ~ hadoop_current %}
+{% set props = {
+  'mapreduce.framework.name': 'yarn',
+  'yarn.app.mapreduce.am.env': mr_home,
+  'mapreduce.map.env': mr_home,
+  'mapreduce.reduce.env': mr_home,
+  'mapreduce.application.classpath': '$HADOOP_MAPRED_HOME/share/hadoop/mapreduce/*:$HADOOP_MAPRED_HOME/share/hadoop/mapreduce/lib/*',
+  'yarn.app.mapreduce.am.job.client.port-range': hadoop_mapred_am_port_range,
+  'yarn.app.mapreduce.am.staging-dir': '/tmp/hadoop-yarn/staging',
+  'mapreduce.jobhistory.intermediate-done-dir': '/mr-history/tmp',
+  'mapreduce.jobhistory.done-dir': '/mr-history/done',
+  'mapreduce.jobhistory.bind-host': '0.0.0.0'
+} %}
+{% if hadoop_jhs_addrs | length > 0 %}
+{%   set _ = props.update({
+  'mapreduce.jobhistory.address': hadoop_jhs_addrs[0] ~ ':' ~ hadoop_ports.jhs_rpc,
+  'mapreduce.jobhistory.webapp.address': hadoop_jhs_addrs[0] ~ ':' ~ hadoop_ports.jhs_web,
+  'mapreduce.jobhistory.admin.address': hadoop_jhs_addrs[0] ~ ':' ~ hadoop_ports.jhs_admin
+}) %}
+{% endif %}
+{% set _ = props.update(hadoop_extra_mapred_site | default({}, true)) %}
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+<!-- {{ ansible_managed }} -->
+<!-- Generated for {{ inventory_hostname }} - cluster {{ hadoop_cluster_name }}. Local edits are overwritten. -->
+<configuration>
+{% for name, value in props | dictsort %}
+  <property>
+    <name>{{ name }}</name>
+    <value>{{ (value | string | lower) if value is boolean else (value | string | e) }}</value>
+  </property>
+{% endfor %}
+</configuration>

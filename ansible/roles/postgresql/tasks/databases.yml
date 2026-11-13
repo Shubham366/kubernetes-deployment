@@ -1,0 +1,51 @@
+---
+# Databases on the primary. CREATE DATABASE cannot run inside a DO block or a
+# transaction, so existence is checked first and only missing ones are
+# created. Existing databases are left alone, except that the owner is
+# corrected when it differs from the requested one.
+
+- name: Databases | existing databases and owners
+  ansible.builtin.command: "{{ __pg_psql }}"
+  args:
+    stdin: "SELECT datname || '|' || pg_catalog.pg_get_userbyid(datdba) FROM pg_catalog.pg_database;"
+  become: true
+  become_user: postgres
+  register: __pg_existing_dbs
+  changed_when: false
+
+- name: Databases | index existing databases
+  ansible.builtin.set_fact:
+    __pg_db_owners: "{{ dict(__pg_existing_dbs.stdout_lines | map('split', '|') | list) }}"
+
+# TEMPLATE template0 is required to pick an encoding that differs from
+# template1's; it is harmless otherwise.
+- name: Databases | create missing databases
+  ansible.builtin.command: "{{ __pg_psql }}"
+  args:
+    stdin: >-
+      CREATE DATABASE "{{ item.name }}"
+      {{ ('OWNER "' ~ item.owner ~ '"') if item.owner | default('', true) | length > 0 else '' }}
+      ENCODING '{{ item.encoding | default('UTF8', true) }}'
+      TEMPLATE template0;
+  become: true
+  become_user: postgres
+  loop: "{{ postgresql_databases }}"
+  loop_control:
+    label: "{{ item.name }}"
+  changed_when: true
+  when: item.name not in __pg_db_owners
+
+- name: Databases | fix owner of existing databases
+  ansible.builtin.command: "{{ __pg_psql }}"
+  args:
+    stdin: 'ALTER DATABASE "{{ item.name }}" OWNER TO "{{ item.owner }}";'
+  become: true
+  become_user: postgres
+  loop: "{{ postgresql_databases }}"
+  loop_control:
+    label: "{{ item.name }}"
+  changed_when: true
+  when:
+    - item.name in __pg_db_owners
+    - item.owner | default('', true) | length > 0
+    - __pg_db_owners[item.name] != item.owner

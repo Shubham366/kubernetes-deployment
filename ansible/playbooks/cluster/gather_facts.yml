@@ -1,0 +1,56 @@
+---
+# Collects the facts the backend stores per node and writes one JSON file per
+# host on the controller: {{ facts_output_dir }}/{{ inventory_hostname }}.json
+- name: Gather node facts
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: true
+  become: true
+  vars:
+    facts_real_mounts: >-
+      {{ ansible_facts.mounts | default([])
+         | rejectattr('fstype', 'in', ['tmpfs', 'devtmpfs', 'squashfs', 'overlay', 'iso9660'])
+         | list }}
+  tasks:
+    - name: Require facts_output_dir
+      ansible.builtin.assert:
+        that: facts_output_dir is defined and facts_output_dir | length > 0
+        fail_msg: "facts_output_dir must be passed as an extra var"
+      run_once: true
+
+    - name: Collect package manager and init details
+      ansible.builtin.set_fact:
+        node_facts:
+          hostname: "{{ ansible_facts.hostname }}"
+          fqdn: "{{ ansible_facts.fqdn | default(ansible_facts.hostname) }}"
+          distribution: "{{ ansible_facts.distribution }}"
+          distribution_version: "{{ ansible_facts.distribution_version }}"
+          distribution_major_version: "{{ ansible_facts.distribution_major_version }}"
+          os_family: "{{ ansible_facts.os_family }}"
+          kernel: "{{ ansible_facts.kernel }}"
+          architecture: "{{ ansible_facts.architecture }}"
+          virtualization_type: "{{ ansible_facts.virtualization_type | default('') }}"
+          virtualization_role: "{{ ansible_facts.virtualization_role | default('') }}"
+          processor_vcpus: "{{ ansible_facts.processor_vcpus | default(0) }}"
+          memtotal_mb: "{{ ansible_facts.memtotal_mb | default(0) }}"
+          swaptotal_mb: "{{ ansible_facts.swaptotal_mb | default(0) }}"
+          default_ipv4: "{{ ansible_facts.default_ipv4.address | default('') }}"
+          all_ipv4_addresses: "{{ ansible_facts.all_ipv4_addresses | default([]) }}"
+          pkg_mgr: "{{ ansible_facts.pkg_mgr | default('') }}"
+          service_mgr: "{{ ansible_facts.service_mgr | default('') }}"
+          selinux: "{{ ansible_facts.selinux.status | default('unknown') }}"
+          selinux_mode: "{{ ansible_facts.selinux.mode | default('') }}"
+          python_version: "{{ ansible_facts.python_version | default('') }}"
+          uptime_seconds: "{{ ansible_facts.uptime_seconds | default(0) }}"
+          timezone: "{{ ansible_facts.date_time.tz | default('') }}"
+          mounts: "{{ facts_real_mounts | map(attribute='mount') | list }}"
+          root_free_mb: >-
+            {{ ((facts_real_mounts | selectattr('mount', 'equalto', '/') | map(attribute='size_available')
+                 | list | first | default(0)) | int / 1048576) | int }}
+
+    - name: Write facts to the controller
+      ansible.builtin.copy:
+        content: "{{ node_facts | to_nice_json }}"
+        dest: "{{ facts_output_dir }}/{{ inventory_hostname }}.json"
+        mode: "0644"
+      delegate_to: localhost
+      become: false

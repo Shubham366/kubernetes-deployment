@@ -1,0 +1,120 @@
+---
+# =============================================================================
+# Hadoop binaries
+#
+#   <install_dir>/hadoop-<version>/   extracted release (root-owned, read-only
+#                                     for the service user)
+#   <install_dir>/current             symlink -> active version; the systemd
+#                                     units and profile.d only reference this,
+#                                     so a version bump is "extract + relink"
+#   <conf_dir>                        configuration, outside the release tree
+# =============================================================================
+
+- name: Install | Is this version already extracted?
+  ansible.builtin.stat:
+    path: "{{ hadoop_home }}/bin/hdfs"
+  register: hadoop_bin_stat
+
+- name: Install | Download and extract Hadoop {{ hadoop_version }}
+  when: not hadoop_bin_stat.stat.exists
+  block:
+    - name: Install | Show the download source
+      ansible.builtin.debug:
+        msg: "Downloading {{ hadoop_effective_download_url }} (checksum: {{ hadoop_effective_checksum | default('none', true) }})"
+
+    # The tarball is ~700 MB: generous timeout, a few retries, and the
+    # checksum (when supplied) is verified by get_url itself.
+    - name: Install | Download the release tarball
+      ansible.builtin.get_url:
+        url: "{{ hadoop_effective_download_url }}"
+        dest: "{{ hadoop_dist_dir }}/{{ hadoop_tarball }}"
+        checksum: "{{ hadoop_effective_checksum | default(omit, true) }}"
+        mode: "0644"
+        owner: root
+        group: root
+        timeout: "{{ hadoop_download_timeout }}"
+      register: hadoop_download
+      retries: 3
+      delay: 15
+      until: hadoop_download is succeeded
+
+    - name: Install | Create the version directory
+      ansible.builtin.file:
+        path: "{{ hadoop_home }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    # --strip-components makes this independent of the top-level directory
+    # name inside the archive (custom builds from hadoop_download_url).
+    - name: Install | Extract
+      ansible.builtin.unarchive:
+        src: "{{ hadoop_dist_dir }}/{{ hadoop_tarball }}"
+        dest: "{{ hadoop_home }}"
+        remote_src: true
+        owner: root
+        group: root
+        extra_opts:
+          - --strip-components=1
+          - --no-same-owner
+        creates: "{{ hadoop_home }}/bin/hdfs"
+
+    - name: Install | Verify the extracted release
+      ansible.builtin.stat:
+        path: "{{ hadoop_home }}/bin/hdfs"
+      register: hadoop_bin_verify
+      failed_when: not hadoop_bin_verify.stat.exists
+
+    - name: Install | Remove the tarball
+      ansible.builtin.file:
+        path: "{{ hadoop_dist_dir }}/{{ hadoop_tarball }}"
+        state: absent
+      when: not (hadoop_keep_tarball | bool)
+
+# A changed link means a version switch: running daemons must be restarted.
+- name: Install | Point 'current' at {{ hadoop_version }}
+  ansible.builtin.file:
+    src: "{{ hadoop_home }}"
+    dest: "{{ hadoop_current }}"
+    state: link
+    force: true
+  notify: hadoop config changed
+
+# Seed the config directory with the files we do not template
+# (log4j.properties, capacity-scheduler.xml, *-policy.xml ...). Runs once.
+- name: Install | Seed the configuration directory from the release
+  ansible.builtin.command:
+    cmd: "cp -a {{ hadoop_home }}/etc/hadoop/. {{ hadoop_conf_dir }}/"
+    creates: "{{ hadoop_conf_dir }}/log4j.properties"
+
+- name: Install | Configuration directory ownership
+  ansible.builtin.file:
+    path: "{{ hadoop_conf_dir }}"
+    state: directory
+    owner: "{{ hadoop_user }}"
+    group: "{{ hadoop_group }}"
+    recurse: true
+
+- name: Install | Login environment (HADOOP_HOME, PATH)
+  ansible.builtin.template:
+    src: hadoop-profile.sh.j2
+    dest: /etc/profile.d/hadoop.sh
+    owner: root
+    group: root
+    mode: "0644"
+
+# Files extracted under /opt inherit usr_t; make sure nothing carries a stale
+# context from a previous location. No-op on systems without SELinux.
+- name: Install | Restore SELinux contexts on the install tree
+  ansible.builtin.shell: |
+    command -v restorecon >/dev/null 2>&1 || exit 0
+    command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled || exit 0
+    restorecon -R {{ hadoop_install_dir | quote }} {{ hadoop_conf_dir | quote }}
+  args:
+    executable: /bin/sh
+  changed_when: false
+  failed_when: false
+  when:
+    - ansible_os_family == 'RedHat'
+    - not hadoop_bin_stat.stat.exists

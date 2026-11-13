@@ -1,0 +1,11 @@
+{
+  "mode": "security",
+  "strategy": "canary",
+  "canary_nodes": ["an-worker-04"],
+  "batch_size": 1,
+  "reboot": "if_required",
+  "exclude": ["docker-ce*"],
+  "kernel_update": true,
+  "services_to_verify": ["sshd"],
+  "post_scan": true
+}

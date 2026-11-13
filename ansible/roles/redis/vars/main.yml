@@ -1,0 +1,89 @@
+---
+# Internal, derived variables. Lazily evaluated, so they always reflect the
+# current host and the extra vars of the run. Do not override.
+
+# --- topology (groups may be absent from the generated inventory) -------------
+__redis_master_group: "{{ groups.get('redis_master', []) }}"
+__redis_replica_group: "{{ groups.get('redis_replica', []) }}"
+__redis_sentinel_group: "{{ groups.get('redis_sentinel', []) }}"
+__redis_cluster_group: "{{ groups.get('redis_cluster', []) }}"
+__redis_data_nodes: "{{ (__redis_master_group + __redis_replica_group + __redis_cluster_group) | unique }}"
+
+__redis_is_data_node: "{{ inventory_hostname in __redis_data_nodes }}"
+__redis_is_replica: "{{ inventory_hostname in __redis_replica_group }}"
+__redis_is_sentinel: "{{ inventory_hostname in __redis_sentinel_group }}"
+
+# The backend may pass the list as JSON or as a comma separated string.
+__redis_new_nodes: >-
+  {{ (redis_new_nodes.split(',') | map('trim') | select | list)
+     if redis_new_nodes is string else (redis_new_nodes | default([], true)) }}
+
+__redis_master_host: "{{ __redis_master_group | first | default('') }}"
+__redis_master_addr: >-
+  {{ (hostvars[__redis_master_host].ansible_host | default(__redis_master_host))
+     if (__redis_master_host | length > 0) else '' }}
+
+# Cluster nodes that are already part of the cluster (i.e. not being added now)
+__redis_cluster_existing: "{{ __redis_cluster_group | difference(__redis_new_nodes) }}"
+__redis_cluster_seed: "{{ __redis_cluster_existing | first | default('') }}"
+__redis_cluster_min_nodes: "{{ 3 * ((redis_cluster_replicas | int) + 1) }}"
+
+# --- addressing ---------------------------------------------------------------
+__redis_ipv4_re: '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+__redis_self_addr: "{{ ansible_host | default(inventory_hostname) }}"
+
+# `bind` needs an IP. If ansible_host is a DNS name fall back to the default
+# IPv4 address from facts, and to 0.0.0.0 as a last resort.
+__redis_bind_ip: >-
+  {{ __redis_self_addr if (__redis_self_addr is match(__redis_ipv4_re))
+     else (ansible_default_ipv4.address | default('0.0.0.0')) }}
+__redis_bind_effective: >-
+  {{ ((redis_bind | join(' ')) if (redis_bind is not string) else redis_bind)
+     if (redis_bind | default('', true) | length > 0)
+     else ('0.0.0.0' if __redis_bind_ip == '0.0.0.0'
+           else ([__redis_bind_ip, '127.0.0.1'] | unique | join(' '))) }}
+
+# Address redis-cli on the node itself should connect to.
+__redis_cli_host: >-
+  {{ '127.0.0.1'
+     if ('127.0.0.1' in __redis_bind_effective or '0.0.0.0' in __redis_bind_effective or '*' in __redis_bind_effective)
+     else (__redis_bind_effective.split() | first | regex_replace('^-', '')) }}
+
+# --- commands -----------------------------------------------------------------
+# redis_bin_dir is a fact set by tasks/setup_vars.yml
+__redis_server_bin: "{{ redis_bin_dir }}/redis-server"
+__redis_cli_bin: "{{ redis_bin_dir }}/redis-cli"
+__redis_cli: "{{ __redis_cli_bin }} -h {{ __redis_cli_host }} -p {{ redis_port }}"
+__redis_sentinel_cli: "{{ __redis_cli_bin }} -h {{ __redis_cli_host }} -p {{ redis_sentinel_port }}"
+# The password is handed to redis-cli through the environment so that it never
+# shows up in the process list or in the task's `cmd` output.
+__redis_cli_env: "{{ {'REDISCLI_AUTH': (redis_password | string)} if (redis_password | string | length > 0) else {} }}"
+
+# --- files / services ---------------------------------------------------------
+# We always run our own unit + config (named after the port) regardless of the
+# install method, so that Debian/EL and package/source behave identically.
+__redis_service: "redis-{{ redis_port }}"
+__redis_conf_file: "{{ redis_conf_dir }}/redis-{{ redis_port }}.conf"
+__redis_log_file: "{{ redis_log_dir }}/redis-{{ redis_port }}.log"
+__redis_unit_file: "/etc/systemd/system/{{ __redis_service }}.service"
+
+__redis_sentinel_service: "redis-sentinel-{{ redis_sentinel_port }}"
+__redis_sentinel_conf_file: "{{ redis_conf_dir }}/sentinel-{{ redis_sentinel_port }}.conf"
+__redis_sentinel_seed_file: "{{ redis_conf_dir }}/.sentinel-{{ redis_sentinel_port }}.conf.seed"
+__redis_sentinel_log_file: "{{ redis_log_dir }}/sentinel-{{ redis_sentinel_port }}.log"
+__redis_sentinel_dir: "{{ redis_data_dir }}/sentinel-{{ redis_sentinel_port }}"
+__redis_sentinel_unit_file: "/etc/systemd/system/{{ __redis_sentinel_service }}.service"
+
+__redis_sysctl_file: /etc/sysctl.d/60-redis.conf
+__redis_thp_service: disable-thp-redis
+
+__redis_sentinel_quorum: >-
+  {{ redis_sentinel_quorum if (redis_sentinel_quorum | string | length > 0)
+     else ((__redis_sentinel_group | length) // 2 + 1) }}
+
+# --- firewall -----------------------------------------------------------------
+# data port, cluster bus port (+10000) and the sentinel port, as applicable.
+__redis_fw_ports: >-
+  {{ ([redis_port | int] if __redis_is_data_node else [])
+     + ([(redis_port | int) + 10000] if (__redis_is_data_node and redis_mode == 'cluster') else [])
+     + ([redis_sentinel_port | int] if (__redis_is_sentinel and redis_mode == 'sentinel') else []) }}

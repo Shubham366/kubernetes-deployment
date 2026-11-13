@@ -1,0 +1,133 @@
+---
+# =============================================================================
+# Redis role defaults
+#
+# Everything here can be overridden with extra vars (-e) by the provisioning
+# backend. Variables in the first block are the "contract" with the backend;
+# the second block are tunables added by this role (all optional).
+# =============================================================================
+
+# ----------------------------------------------------------------------------
+# Contract variables
+# ----------------------------------------------------------------------------
+
+# install | start | stop | restart | status | uninstall | scale_out
+redis_action: install
+
+# standalone | replication | sentinel | cluster
+# When the backend does not pass it, derive the mode from the inventory groups.
+redis_mode: >-
+  {{ 'cluster' if (groups.get('redis_cluster', []) | length > 0)
+     else 'sentinel' if (groups.get('redis_sentinel', []) | length > 0)
+     else 'replication' if (groups.get('redis_replica', []) | length > 0)
+     else 'standalone' }}
+
+# Exact version, honoured when redis_install_method == source.
+redis_version: "7.2.5"
+
+# source  -> build the exact redis_version from download.redis.io
+# package -> distro package (version is whatever the distro ships)
+redis_install_method: source
+
+redis_port: 6379
+
+# Space separated list (or YAML list) of addresses. Empty = "<ansible_host> 127.0.0.1".
+redis_bind: ""
+
+# Optional. Used for requirepass, masterauth and sentinel auth-pass.
+redis_password: ""
+
+# e.g. "2gb". Empty = no limit.
+redis_maxmemory: ""
+redis_maxmemory_policy: noeviction
+
+# rdb | aof | both | none
+redis_persistence: rdb
+
+redis_data_dir: /var/lib/redis
+
+# Redis Cluster: replicas per master for `redis-cli --cluster create`.
+redis_cluster_replicas: 1
+
+redis_sentinel_port: 26379
+# Empty = majority of the sentinels in the inventory (n // 2 + 1).
+redis_sentinel_quorum: ""
+redis_sentinel_master_name: mymaster
+
+# scale_out: inventory hostnames of the nodes being added. They must already be
+# present in the inventory (in redis_cluster / redis_replica / redis_sentinel).
+redis_new_nodes: []
+
+# uninstall: also delete data, config and logs.
+redis_purge_data: false
+
+# Free-form "directive: value" pairs appended to redis.conf.
+redis_extra_config: {}
+
+# ----------------------------------------------------------------------------
+# Additional tunables (not part of the backend contract)
+# ----------------------------------------------------------------------------
+
+redis_user: redis
+redis_group: redis
+redis_conf_dir: /etc/redis
+redis_log_dir: /var/log/redis
+
+# --- source build ---
+redis_source_url: "https://download.redis.io/releases/redis-{{ redis_version }}.tar.gz"
+# Optional "sha256:<hex>" checksum for the tarball.
+redis_source_checksum: ""
+redis_source_dir: /usr/local/src
+redis_source_prefix: /usr/local
+redis_build_tls: false
+
+# --- OS integration ---
+redis_manage_kernel: true        # sysctl + THP
+redis_manage_firewall: true      # firewalld / ufw, only when they are active
+redis_manage_selinux: true       # label non-default ports (package installs on EL)
+redis_manage_logrotate: true
+redis_somaxconn: 65535
+redis_limit_nofile: 65535
+
+# --- redis.conf ---
+# With no password we must switch protected-mode off, otherwise replicas,
+# sentinels and cluster peers on other hosts are refused.
+redis_protected_mode: "{{ 'yes' if (redis_password | string | length > 0) else 'no' }}"
+redis_tcp_backlog: 511
+redis_tcp_keepalive: 300
+redis_timeout: 0
+redis_loglevel: notice
+redis_databases: 16
+redis_rdb_save_points:
+  - "900 1"
+  - "300 10"
+  - "60 10000"
+redis_appendfsync: everysec
+redis_repl_backlog_size: 64mb
+redis_min_replicas_to_write: 0
+redis_min_replicas_max_lag: 10
+redis_replica_read_only: true
+
+# --- cluster ---
+redis_cluster_node_timeout: 15000
+redis_cluster_require_full_coverage: true
+# scale_out in cluster mode: add the new nodes as replicas instead of masters.
+redis_scale_out_as_replica: false
+# scale_out in cluster mode: move slots onto the new (empty) masters.
+redis_scale_out_rebalance: true
+
+# --- sentinel ---
+redis_sentinel_down_after_ms: 5000
+redis_sentinel_failover_timeout_ms: 60000
+redis_sentinel_parallel_syncs: 1
+# Fewer than 3 sentinels cannot survive a failure; refuse unless told otherwise.
+redis_sentinel_allow_small: false
+
+# Sentinel rewrites redis.conf (CONFIG REWRITE) and sentinel.conf on failover.
+# Once those files exist in sentinel mode they are left alone unless this is
+# true (the current replicaof line is preserved even then).
+redis_force_reconfigure: false
+
+# How long to wait for a node to come back / resync during rolling restarts.
+redis_wait_retries: 60
+redis_wait_delay: 2

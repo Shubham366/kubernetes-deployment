@@ -1,0 +1,176 @@
+---
+# =============================================================================
+# ZooKeeper ensemble (hosts of the hadoop_zookeeper group)
+#
+# Used by HDFS HA (ZKFC leader election + fencing lock) and, when two
+# ResourceManagers exist, by YARN HA (election + RM state store).
+#
+#   <zk_install_dir>/apache-zookeeper-<v>-bin   release
+#   <zk_install_dir>/current                    symlink to the active release
+#   <zk_conf_dir>/zoo.cfg, java.env             configuration
+#   <zk_data_dir>/myid                          this server's id
+#
+# Starting is done by the playbook (services.yml) after every member has been
+# configured, so the ensemble can form a quorum straight away.
+# Assumes prepare.yml ran on this host first (packages, Java).
+# =============================================================================
+
+- name: ZooKeeper | Server id for this host
+  ansible.builtin.assert:
+    that:
+      - (hadoop_zk_myid | int) >= 1
+      - (hadoop_zk_myid | int) <= 255
+    fail_msg: "Could not derive a ZooKeeper myid (1-255) for {{ inventory_hostname }} (got '{{ hadoop_zk_myid }}')."
+    quiet: true
+
+- name: ZooKeeper | Group
+  ansible.builtin.group:
+    name: "{{ hadoop_zookeeper_group }}"
+    system: true
+    state: present
+
+- name: ZooKeeper | User
+  ansible.builtin.user:
+    name: "{{ hadoop_zookeeper_user }}"
+    group: "{{ hadoop_zookeeper_group }}"
+    home: "{{ hadoop_zookeeper_data_dir }}"
+    create_home: false
+    shell: /sbin/nologin
+    system: true
+    comment: "Apache ZooKeeper"
+    state: present
+
+- name: ZooKeeper | Directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner | default(hadoop_zookeeper_user) }}"
+    group: "{{ item.group | default(hadoop_zookeeper_group) }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ hadoop_zookeeper_install_dir }}", mode: "0755", owner: root, group: root }
+    - { path: "{{ hadoop_zookeeper_conf_dir }}", mode: "0755" }
+    - { path: "{{ hadoop_zookeeper_data_dir }}", mode: "0750" }
+    - { path: "{{ hadoop_zookeeper_log_dir }}", mode: "0755" }
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: ZooKeeper | Is this version already extracted?
+  ansible.builtin.stat:
+    path: "{{ hadoop_zk_home }}/bin/zkServer.sh"
+  register: hadoop_zk_bin_stat
+
+- name: ZooKeeper | Download and extract {{ hadoop_zookeeper_version }}
+  when: not hadoop_zk_bin_stat.stat.exists
+  block:
+    - name: ZooKeeper | Download the release tarball
+      ansible.builtin.get_url:
+        url: "{{ hadoop_zk_effective_download_url }}"
+        dest: "{{ hadoop_zookeeper_install_dir }}/{{ hadoop_zk_tarball }}"
+        checksum: "{{ hadoop_zk_effective_checksum | default(omit, true) }}"
+        mode: "0644"
+        timeout: "{{ hadoop_download_timeout }}"
+      register: hadoop_zk_download
+      retries: 3
+      delay: 15
+      until: hadoop_zk_download is succeeded
+
+    - name: ZooKeeper | Create the version directory
+      ansible.builtin.file:
+        path: "{{ hadoop_zk_home }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: ZooKeeper | Extract
+      ansible.builtin.unarchive:
+        src: "{{ hadoop_zookeeper_install_dir }}/{{ hadoop_zk_tarball }}"
+        dest: "{{ hadoop_zk_home }}"
+        remote_src: true
+        owner: root
+        group: root
+        extra_opts:
+          - --strip-components=1
+          - --no-same-owner
+        creates: "{{ hadoop_zk_home }}/bin/zkServer.sh"
+
+    - name: ZooKeeper | Remove the tarball
+      ansible.builtin.file:
+        path: "{{ hadoop_zookeeper_install_dir }}/{{ hadoop_zk_tarball }}"
+        state: absent
+
+- name: ZooKeeper | Point 'current' at {{ hadoop_zookeeper_version }}
+  ansible.builtin.file:
+    src: "{{ hadoop_zk_home }}"
+    dest: "{{ hadoop_zk_current }}"
+    state: link
+    force: true
+  notify: hadoop zookeeper config changed
+
+# logback.xml / log4j.properties etc. shipped with the release.
+- name: ZooKeeper | Seed the configuration directory from the release
+  ansible.builtin.command:
+    cmd: "cp -a {{ hadoop_zk_home }}/conf/. {{ hadoop_zookeeper_conf_dir }}/"
+    creates: "{{ hadoop_zookeeper_conf_dir }}/zoo_sample.cfg"
+
+- name: ZooKeeper | zoo.cfg
+  ansible.builtin.template:
+    src: zoo.cfg.j2
+    dest: "{{ hadoop_zookeeper_conf_dir }}/zoo.cfg"
+    owner: "{{ hadoop_zookeeper_user }}"
+    group: "{{ hadoop_zookeeper_group }}"
+    mode: "0644"
+  notify: hadoop zookeeper config changed
+
+- name: ZooKeeper | java.env (JAVA_HOME, heap)
+  ansible.builtin.template:
+    src: zookeeper-java.env.j2
+    dest: "{{ hadoop_zookeeper_conf_dir }}/java.env"
+    owner: "{{ hadoop_zookeeper_user }}"
+    group: "{{ hadoop_zookeeper_group }}"
+    mode: "0644"
+  notify: hadoop zookeeper config changed
+
+# myid ties this data directory to "server.<id>" in zoo.cfg. It must never
+# change once the server has joined an ensemble, so an existing file wins.
+- name: ZooKeeper | myid
+  ansible.builtin.copy:
+    content: "{{ hadoop_zk_myid | int }}\n"
+    dest: "{{ hadoop_zookeeper_data_dir }}/myid"
+    owner: "{{ hadoop_zookeeper_user }}"
+    group: "{{ hadoop_zookeeper_group }}"
+    mode: "0644"
+    force: false
+
+- name: ZooKeeper | Read back myid
+  ansible.builtin.slurp:
+    src: "{{ hadoop_zookeeper_data_dir }}/myid"
+  register: hadoop_zk_myid_file
+
+- name: ZooKeeper | myid on disk must match the configuration
+  ansible.builtin.assert:
+    that:
+      - (hadoop_zk_myid_file.content | b64decode | trim | int) == (hadoop_zk_myid | int)
+    fail_msg: >-
+      {{ hadoop_zookeeper_data_dir }}/myid on {{ inventory_hostname }} contains
+      {{ hadoop_zk_myid_file.content | b64decode | trim }} but the inventory order
+      now yields {{ hadoop_zk_myid }}. The hadoop_zookeeper group was reordered:
+      pin the id with the host var hadoop_zookeeper_myid instead of rewriting it.
+    quiet: true
+
+- name: ZooKeeper | systemd unit
+  ansible.builtin.template:
+    src: zookeeper.service.j2
+    dest: /etc/systemd/system/zookeeper.service
+    owner: root
+    group: root
+    mode: "0644"
+  register: hadoop_zk_unit
+  notify: hadoop zookeeper config changed
+
+- name: ZooKeeper | Reload systemd and enable the unit
+  ansible.builtin.systemd:
+    name: zookeeper.service
+    daemon_reload: "{{ hadoop_zk_unit is changed }}"
+    enabled: true

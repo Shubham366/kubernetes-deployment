@@ -1,0 +1,22 @@
+---
+# Order matters: handlers run in the order listed here, not in notify order.
+# daemon-reload -> restart -> reload, so a pending restart always uses the
+# current unit files and a reload never precedes the restart that starts
+# the server for the first time.
+
+- name: Reload systemd for postgresql
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+# "restarted" also starts a stopped server, which is how a freshly created
+# cluster (or a replica that was just base-backed-up) is brought up.
+- name: Restart postgresql
+  ansible.builtin.systemd:
+    name: "{{ __pg_service }}"
+    state: restarted
+
+# pg_hba.conf changes only need a reload (SIGHUP), existing sessions survive.
+- name: Reload postgresql
+  ansible.builtin.systemd:
+    name: "{{ __pg_service }}"
+    state: reloaded

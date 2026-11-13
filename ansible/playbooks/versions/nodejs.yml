@@ -1,0 +1,264 @@
+---
+# Installs or removes Node.js.
+#
+# Extra vars:
+#   nodejs_version         major ("20") or full ("20.11.1")      (required)
+#   nodejs_state           present | absent                       (default present)
+#   nodejs_install_method  nodesource | tarball                   (default nodesource)
+#   nodejs_npm_packages    global npm packages to install         (default [])
+#   nodejs_dist_mirror     default https://nodejs.org/dist
+#   nodejs_install_root    default /opt/nodejs (tarball method)
+- name: Manage the Node.js runtime
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: true
+  become: true
+  vars:
+    nodejs_state: present
+    nodejs_install_method: nodesource
+    nodejs_npm_packages: []
+    nodejs_dist_mirror: https://nodejs.org/dist
+    nodejs_install_root: /opt/nodejs
+    nodejs_major: "{{ (nodejs_version | string).split('.')[0] }}"
+    nodejs_is_full_version: "{{ (nodejs_version | string) is match('^[0-9]+\\.[0-9]+\\.[0-9]+$') }}"
+    nodejs_is_debian: "{{ ansible_facts.os_family == 'Debian' }}"
+    nodejs_el_major: "{{ ansible_facts.distribution_major_version | int }}"
+    nodejs_arch: "{{ 'arm64' if ansible_facts.architecture in ['aarch64', 'arm64'] else 'x64' }}"
+  tasks:
+    - name: Validate input
+      ansible.builtin.assert:
+        that:
+          - nodejs_version is defined
+          - (nodejs_version | string) is match('^[0-9]+(\.[0-9]+\.[0-9]+)?$')
+          - nodejs_state in ['present', 'absent']
+          - nodejs_install_method in ['nodesource', 'tarball']
+        fail_msg: "nodejs_version must be a major (20) or full version (20.11.1)"
+
+    - name: Refuse Node.js >= 18 on EL7 (needs glibc 2.28)
+      ansible.builtin.assert:
+        that: not (ansible_facts.os_family == 'RedHat' and nodejs_el_major | int == 7 and nodejs_major | int >= 18)
+        fail_msg: "Node.js {{ nodejs_major }} cannot run on EL7; the newest supported major is 16"
+      when: nodejs_state == 'present'
+
+    # ----------------------------------------------------------- nodesource
+    - name: Install from NodeSource (Debian family)
+      when:
+        - nodejs_state == 'present'
+        - nodejs_install_method == 'nodesource'
+        - nodejs_is_debian
+      block:
+        - name: Install repository prerequisites
+          ansible.builtin.apt:
+            name: [ca-certificates, curl, gnupg]
+            state: present
+            update_cache: true
+            cache_valid_time: 3600
+
+        - name: Create the keyring directory
+          ansible.builtin.file:
+            path: /etc/apt/keyrings
+            state: directory
+            mode: "0755"
+
+        - name: Install the NodeSource signing key
+          ansible.builtin.get_url:
+            url: https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key
+            dest: /etc/apt/keyrings/nodesource.asc
+            mode: "0644"
+          register: nodejs_key
+          retries: 3
+          delay: 10
+          until: nodejs_key is succeeded
+
+        - name: Configure the NodeSource repository for this major
+          ansible.builtin.copy:
+            dest: /etc/apt/sources.list.d/nodesource.list
+            mode: "0644"
+            content: |
+              deb [signed-by=/etc/apt/keyrings/nodesource.asc] https://deb.nodesource.com/node_{{ nodejs_major }}.x nodistro main
+          register: nodejs_repo
+
+        - name: Prefer NodeSource over the distribution package
+          ansible.builtin.copy:
+            dest: /etc/apt/preferences.d/nodejs
+            mode: "0644"
+            content: |
+              Package: nodejs
+              Pin: origin deb.nodesource.com
+              Pin-Priority: 600
+
+        - name: Install Node.js
+          ansible.builtin.apt:
+            name: "{{ 'nodejs=' ~ nodejs_version ~ '-*' if nodejs_is_full_version | bool else 'nodejs' }}"
+            state: "{{ 'present' if nodejs_is_full_version | bool else 'latest' }}"
+            update_cache: "{{ nodejs_repo is changed }}"
+            allow_downgrade: true
+
+    - name: Install from NodeSource (RedHat family)
+      when:
+        - nodejs_state == 'present'
+        - nodejs_install_method == 'nodesource'
+        - not nodejs_is_debian
+      block:
+        - name: Disable the distribution nodejs module stream
+          ansible.builtin.command: dnf -y module disable nodejs
+          when: nodejs_el_major | int >= 8
+          register: nodejs_module
+          changed_when: "'Nothing to do' not in nodejs_module.stdout"
+          failed_when: false
+
+        - name: Configure the NodeSource repository for this major
+          ansible.builtin.yum_repository:
+            name: nodesource-nodejs
+            description: "Node.js {{ nodejs_major }}.x packages from NodeSource"
+            baseurl: "https://rpm.nodesource.com/pub_{{ nodejs_major }}.x/nodistro/nodejs/$basearch"
+            gpgcheck: true
+            gpgkey: https://rpm.nodesource.com/gpgkey/ns-operations-public.key
+            enabled: true
+            module_hotfixes: true
+          register: nodejs_repo
+
+        - name: Drop cached metadata after a repository change
+          ansible.builtin.command: "{{ ansible_facts.pkg_mgr }} clean metadata"
+          when: nodejs_repo is changed
+          changed_when: true
+
+        - name: Install Node.js
+          ansible.builtin.package:
+            name: "{{ 'nodejs-' ~ nodejs_version if nodejs_is_full_version | bool else 'nodejs' }}"
+            state: "{{ 'present' if nodejs_is_full_version | bool else 'latest' }}"
+
+    # -------------------------------------------------------------- tarball
+    - name: Install from the official tarball
+      when:
+        - nodejs_state == 'present'
+        - nodejs_install_method == 'tarball'
+      block:
+        - name: Install tarball prerequisites
+          ansible.builtin.package:
+            name: "{{ ['tar', 'ca-certificates', 'xz-utils' if nodejs_is_debian else 'xz'] }}"
+            state: present
+
+        - name: Look up the newest release of this major
+          ansible.builtin.uri:
+            url: "{{ nodejs_dist_mirror }}/index.json"
+            return_content: true
+          register: nodejs_index
+          delegate_to: localhost
+          become: false
+          run_once: true
+          when: not nodejs_is_full_version | bool
+
+        - name: Resolve the exact version
+          ansible.builtin.set_fact:
+            nodejs_resolved: >-
+              {{ nodejs_version if nodejs_is_full_version | bool else
+                 (nodejs_index.json | map(attribute='version')
+                  | select('match', '^v' ~ nodejs_major ~ '\.') | list | first | default('') | regex_replace('^v', '')) }}
+
+        - name: Fail when no release exists for this major
+          ansible.builtin.assert:
+            that: nodejs_resolved | length > 0
+            fail_msg: "No Node.js release found for major {{ nodejs_major }}"
+
+        - name: Check for an existing installation of that version
+          ansible.builtin.stat:
+            path: "{{ nodejs_install_root }}/{{ nodejs_resolved }}/bin/node"
+          register: nodejs_existing
+
+        - name: Create the install directory
+          ansible.builtin.file:
+            path: "{{ nodejs_install_root }}/{{ nodejs_resolved }}"
+            state: directory
+            mode: "0755"
+
+        - name: Download Node.js
+          ansible.builtin.get_url:
+            url: "{{ nodejs_dist_mirror }}/v{{ nodejs_resolved }}/node-v{{ nodejs_resolved }}-linux-{{ nodejs_arch }}.tar.xz"
+            dest: "/tmp/node-v{{ nodejs_resolved }}.tar.xz"
+            mode: "0644"
+            timeout: 120
+          register: nodejs_download
+          retries: 3
+          delay: 15
+          until: nodejs_download is succeeded
+          when: not nodejs_existing.stat.exists
+
+        - name: Unpack Node.js
+          ansible.builtin.unarchive:
+            src: "/tmp/node-v{{ nodejs_resolved }}.tar.xz"
+            dest: "{{ nodejs_install_root }}/{{ nodejs_resolved }}"
+            remote_src: true
+            extra_opts: ["--strip-components=1"]
+          when: not nodejs_existing.stat.exists
+
+        - name: Remove the downloaded archive
+          ansible.builtin.file:
+            path: "/tmp/node-v{{ nodejs_resolved }}.tar.xz"
+            state: absent
+
+        - name: Point the current symlink at this version
+          ansible.builtin.file:
+            src: "{{ nodejs_install_root }}/{{ nodejs_resolved }}"
+            dest: "{{ nodejs_install_root }}/current"
+            state: link
+            force: true
+
+        - name: Expose node, npm and npx
+          ansible.builtin.file:
+            src: "{{ nodejs_install_root }}/current/bin/{{ item }}"
+            dest: "/usr/local/bin/{{ item }}"
+            state: link
+            force: true
+          loop: [node, npm, npx]
+
+    - name: Verify Node.js
+      ansible.builtin.command: node --version
+      register: nodejs_verify
+      changed_when: false
+      environment:
+        PATH: "/usr/local/bin:/usr/bin:/bin"
+      when: nodejs_state == 'present'
+
+    - name: Check the installed major
+      ansible.builtin.assert:
+        that: nodejs_verify.stdout is match('^v' ~ nodejs_major ~ '\.')
+        fail_msg: "Expected Node.js {{ nodejs_major }}.x but 'node --version' reports {{ nodejs_verify.stdout }}"
+      when: nodejs_state == 'present'
+
+    - name: Install global npm packages
+      ansible.builtin.command: "npm install -g {{ item | quote }}"
+      loop: "{{ nodejs_npm_packages }}"
+      environment:
+        PATH: "/usr/local/bin:/usr/bin:/bin"
+      changed_when: true
+      when: nodejs_state == 'present'
+
+    # -------------------------------------------------------------- removal
+    - name: Remove Node.js
+      when: nodejs_state == 'absent'
+      block:
+        - name: Remove the package
+          ansible.builtin.package:
+            name: nodejs
+            state: absent
+
+        - name: Remove NodeSource repository files
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - /etc/apt/sources.list.d/nodesource.list
+            - /etc/apt/preferences.d/nodejs
+            - /etc/apt/keyrings/nodesource.asc
+            - /etc/yum.repos.d/nodesource-nodejs.repo
+
+        - name: Remove tarball installations and links
+          ansible.builtin.shell: |
+            for link in node npm npx; do
+              if [ -L /usr/local/bin/$link ] && readlink /usr/local/bin/$link | grep -q "^{{ nodejs_install_root }}/"; then
+                rm -f /usr/local/bin/$link
+              fi
+            done
+            if [ -d {{ nodejs_install_root | quote }} ]; then rm -rf {{ nodejs_install_root | quote }}; echo removed; fi
+          register: nodejs_removed
+          changed_when: "'removed' in nodejs_removed.stdout"

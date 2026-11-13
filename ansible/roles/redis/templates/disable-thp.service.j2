@@ -1,0 +1,15 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Disable Transparent Huge Pages (required by Redis)
+DefaultDependencies=no
+After=sysinit.target local-fs.target
+Before=basic.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# `$$` is a literal `$` for systemd (otherwise it would expand $f itself).
+ExecStart=/bin/sh -c 'for f in enabled defrag; do p=/sys/kernel/mm/transparent_hugepage/$$f; if [ -w "$$p" ]; then echo never > "$$p"; fi; done; exit 0'
+
+[Install]
+WantedBy=basic.target

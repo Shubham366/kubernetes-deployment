@@ -1,0 +1,119 @@
+---
+# =============================================================================
+# Post-start work, run once on the primary NameNode after the daemons are up.
+#
+#   install / start : wait for safe mode to end, show a short report
+#   install         : create the standard HDFS directories
+#   scale_out       : refreshNodes, wait for the new DataNodes to register,
+#                     optionally start the balancer
+# =============================================================================
+
+# With HA the command reports one line per NameNode; the standby leaves safe
+# mode on its own schedule, so only "is ON" lines are treated as not-ready.
+- name: Post | Wait for HDFS to leave safe mode
+  ansible.builtin.command:
+    cmd: "{{ hadoop_hdfs }} dfsadmin -safemode get"
+  become: true
+  become_user: "{{ hadoop_user }}"
+  register: hadoop_safemode
+  changed_when: false
+  failed_when: hadoop_safemode.rc != 0 or 'Safe mode is ON' in hadoop_safemode.stdout
+  until: hadoop_safemode.rc == 0 and 'Safe mode is ON' not in hadoop_safemode.stdout
+  retries: "{{ hadoop_safemode_wait_retries }}"
+  delay: "{{ hadoop_safemode_wait_delay }}"
+
+# ---------------------------------------------------------------------------
+# install: base directory layout in HDFS (idempotent: test before mkdir)
+# ---------------------------------------------------------------------------
+- name: Post | Create the standard HDFS directories
+  ansible.builtin.shell: |
+    if {{ hadoop_hdfs }} dfs -test -d {{ item.path | quote }}; then
+      exit 0
+    fi
+    {{ hadoop_hdfs }} dfs -mkdir -p {{ item.path | quote }} \
+      && {{ hadoop_hdfs }} dfs -chmod {{ item.mode }} {{ item.path | quote }} \
+      && echo HADOOP_HDFS_CHANGED
+  args:
+    executable: /bin/sh
+  become: true
+  become_user: "{{ hadoop_user }}"
+  loop: "{{ hadoop_hdfs_init_dirs }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: hadoop_hdfs_mkdir
+  changed_when: "'HADOOP_HDFS_CHANGED' in hadoop_hdfs_mkdir.stdout"
+  when: hadoop_action == 'install'
+
+# ---------------------------------------------------------------------------
+# scale_out
+# ---------------------------------------------------------------------------
+# Not strictly required (no dfs.hosts include list is used, so new DataNodes
+# may register freely) but it makes the NameNodes re-read their host files.
+- name: Post | Refresh the NameNode's view of the DataNodes
+  ansible.builtin.command:
+    cmd: "{{ hadoop_hdfs }} dfsadmin -refreshNodes"
+  become: true
+  become_user: "{{ hadoop_user }}"
+  changed_when: true
+  when: hadoop_action == 'scale_out'
+
+- name: Post | Wait for the new DataNodes to register
+  ansible.builtin.command:
+    cmd: "{{ hadoop_hdfs }} dfsadmin -report -live"
+  become: true
+  become_user: "{{ hadoop_user }}"
+  register: hadoop_live_report
+  changed_when: false
+  until: >-
+    hadoop_live_report.rc == 0 and
+    (hadoop_new_node_list | difference(hadoop_registered_new_nodes) | length == 0)
+  vars:
+    # A node counts as registered when its name or its IP shows up in the report.
+    hadoop_registered_new_nodes: >-
+      {%- set found = [] -%}
+      {%- for h in hadoop_new_node_list -%}
+      {%-   if (hadoop_node_map[h].name in (hadoop_live_report.stdout | default('')))
+             or (hadoop_node_map[h].ip and (hadoop_node_map[h].ip ~ ':') in (hadoop_live_report.stdout | default(''))) -%}
+      {%-     set _ = found.append(h) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ found }}
+  retries: 30
+  delay: 10
+  when: hadoop_action == 'scale_out'
+
+# Fire and forget: rebalancing can take hours and must not block the run.
+- name: Post | Start the HDFS balancer in the background
+  ansible.builtin.shell: >-
+    nohup {{ hadoop_hdfs }} balancer -threshold {{ hadoop_balancer_threshold | int }}
+    > {{ hadoop_log_dir }}/balancer-ansible.log 2>&1 &
+  args:
+    executable: /bin/sh
+  become: true
+  become_user: "{{ hadoop_user }}"
+  changed_when: true
+  when:
+    - hadoop_action == 'scale_out'
+    - hadoop_run_balancer_after_scale_out | bool
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+- name: Post | HDFS report
+  ansible.builtin.command:
+    cmd: "{{ hadoop_hdfs }} dfsadmin -report"
+  become: true
+  become_user: "{{ hadoop_user }}"
+  register: hadoop_post_report
+  changed_when: false
+  failed_when: false
+
+- name: Post | Cluster summary
+  ansible.builtin.debug:
+    msg:
+      cluster: "{{ hadoop_cluster_name }}"
+      default_fs: "{{ hadoop_default_fs }}"
+      namenode_ui: "{{ hadoop_nn_addrs | map('regex_replace', '^', 'http://') | map('regex_replace', '$', ':' ~ hadoop_ports.namenode_http) | list }}"
+      resourcemanager_ui: "{{ hadoop_rm_addrs | map('regex_replace', '^', 'http://') | map('regex_replace', '$', ':' ~ hadoop_ports.rm_web) | list }}"
+      historyserver_ui: "{{ hadoop_jhs_addrs | map('regex_replace', '^', 'http://') | map('regex_replace', '$', ':' ~ hadoop_ports.jhs_web) | list }}"
+      hdfs_report: "{{ hadoop_post_report.stdout_lines | default([]) }}"

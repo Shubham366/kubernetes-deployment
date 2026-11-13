@@ -1,0 +1,192 @@
+---
+# Topology / input validation. Uses no facts and every check is run_once:
+# the answer is the same for all hosts.
+
+- name: Preflight | action and mode are valid
+  ansible.builtin.assert:
+    that:
+      - postgresql_action in ['install', 'start', 'stop', 'restart', 'status', 'uninstall', 'add_replica', 'promote']
+      - postgresql_mode in ['standalone', 'replication']
+    fail_msg: "Invalid postgresql_action={{ postgresql_action }} or postgresql_mode={{ postgresql_mode }}"
+    quiet: true
+  run_once: true
+
+- name: Preflight | exactly one primary
+  ansible.builtin.assert:
+    that:
+      - __pg_primary_group | length == 1
+    fail_msg: >-
+      The postgresql_primary group must contain exactly one host,
+      found {{ __pg_primary_group | length }}: {{ __pg_primary_group }}
+    quiet: true
+  run_once: true
+
+- name: Preflight | a host cannot be primary and replica at the same time
+  ansible.builtin.assert:
+    that:
+      - __pg_primary_group | intersect(__pg_replica_group) | length == 0
+    fail_msg: "Hosts in both postgresql_primary and postgresql_replica: {{ __pg_primary_group | intersect(__pg_replica_group) }}"
+    quiet: true
+  run_once: true
+
+- name: Preflight | version and port
+  ansible.builtin.assert:
+    that:
+      - postgresql_version | string is match('^[0-9]+(\.[0-9]+)?$')
+      # standby.signal / primary_conninfo-in-postgresql.conf / pg_promote(): 12+
+      - (__pg_version | int) >= 12
+      - (postgresql_port | int) > 0 and (postgresql_port | int) < 65536
+    fail_msg: >-
+      postgresql_version must be a major version >= 12 (got '{{ postgresql_version }}')
+      and postgresql_port a valid TCP port (got '{{ postgresql_port }}')
+    quiet: true
+  run_once: true
+
+# ---------------------------------------------------------------------------
+# install / add_replica input
+# ---------------------------------------------------------------------------
+
+- name: Preflight | install-time input validation
+  when: postgresql_action in ['install', 'add_replica']
+  run_once: true
+  block:
+    - name: Preflight | replication mode needs replicas
+      ansible.builtin.assert:
+        that:
+          - __pg_replica_group | length >= 1
+        fail_msg: "postgresql_mode=replication but the postgresql_replica group is empty"
+        quiet: true
+      when: postgresql_mode == 'replication'
+
+    - name: Preflight | standalone mode ignores replicas
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: postgresql_mode=standalone but postgresql_replica contains
+          {{ __pg_replica_group }}. These hosts will NOT be configured; use postgresql_mode=replication.
+      when:
+        - postgresql_mode == 'standalone'
+        - postgresql_action == 'install'
+        - __pg_replica_group | length > 0
+
+    - name: Preflight | replication credentials
+      ansible.builtin.assert:
+        that:
+          - postgresql_replication_user | string | length > 0
+          - postgresql_replication_user | string is match('^[A-Za-z_][A-Za-z0-9_]*$')
+          - postgresql_replication_password | string | length > 0
+        fail_msg: >-
+          Replication needs postgresql_replication_user (a plain identifier) and a non-empty
+          postgresql_replication_password.
+        quiet: true
+      when: postgresql_mode == 'replication' or postgresql_action == 'add_replica'
+
+    - name: Preflight | synchronous replication needs a standby
+      ansible.builtin.assert:
+        that:
+          - __pg_replica_group | length >= 1
+          - postgresql_synchronous_method | upper in ['ANY', 'FIRST']
+          - (postgresql_synchronous_num | int) >= 1
+        fail_msg: >-
+          postgresql_synchronous_replication=true requires at least one host in postgresql_replica,
+          postgresql_synchronous_method ANY|FIRST and postgresql_synchronous_num >= 1.
+        quiet: true
+      when: postgresql_synchronous_replication | bool
+
+    - name: Preflight | list / dict typed variables
+      ansible.builtin.assert:
+        that:
+          - postgresql_databases is iterable and postgresql_databases is not string and postgresql_databases is not mapping
+          - postgresql_users is iterable and postgresql_users is not string and postgresql_users is not mapping
+          - postgresql_extensions is iterable and postgresql_extensions is not string and postgresql_extensions is not mapping
+          - postgresql_allowed_cidrs is iterable and postgresql_allowed_cidrs is not string and postgresql_allowed_cidrs is not mapping
+          - postgresql_extra_config is mapping
+        fail_msg: >-
+          postgresql_databases, postgresql_users, postgresql_extensions and postgresql_allowed_cidrs
+          must be lists, postgresql_extra_config a dict.
+        quiet: true
+
+    # Names end up double-quoted in SQL; refuse anything that would need
+    # escaping beyond that, it is almost certainly a mistake.
+    - name: Preflight | database definitions
+      ansible.builtin.assert:
+        that:
+          - item is mapping
+          - item.name is defined
+          - item.name | string is match('^[A-Za-z_][A-Za-z0-9_$.-]*$')
+          - item.owner is not defined or (item.owner | string is match('^[A-Za-z_][A-Za-z0-9_$.-]*$'))
+        fail_msg: "Invalid entry in postgresql_databases (need at least a valid 'name'): {{ item }}"
+        quiet: true
+      loop: "{{ postgresql_databases }}"
+
+    - name: Preflight | user definitions
+      ansible.builtin.assert:
+        that:
+          - item is mapping
+          - item.name is defined
+          - item.name | string is match('^[A-Za-z_][A-Za-z0-9_$.-]*$')
+        fail_msg: "Invalid entry in postgresql_users (need at least a valid 'name')"
+        quiet: true
+      loop: "{{ postgresql_users }}"
+      loop_control:
+        label: "{{ item.name | default('?') }}"
+      no_log: true   # items carry passwords
+
+    - name: Preflight | extension definitions
+      ansible.builtin.assert:
+        that:
+          - item is mapping
+          - item.name is defined
+          - item.name | string is match('^[A-Za-z_][A-Za-z0-9_-]*$')
+        fail_msg: "Invalid entry in postgresql_extensions (need a valid 'name', optional 'database'): {{ item }}"
+        quiet: true
+      loop: "{{ postgresql_extensions }}"
+
+    - name: Preflight | allowed CIDRs look like networks
+      ansible.builtin.assert:
+        that:
+          - item | string is match('^[0-9A-Fa-f:.]+/[0-9]{1,3}$')
+        fail_msg: "postgresql_allowed_cidrs entry '{{ item }}' is not in address/prefix notation (e.g. 10.0.0.0/8)"
+        quiet: true
+      loop: "{{ postgresql_allowed_cidrs + postgresql_replication_allowed_cidrs }}"
+
+# ---------------------------------------------------------------------------
+# add_replica
+# ---------------------------------------------------------------------------
+
+- name: Preflight | add_replica input
+  ansible.builtin.assert:
+    that:
+      - __pg_new_replicas | length > 0
+      - __pg_new_replicas | difference(__pg_replica_group) | length == 0
+    fail_msg: >-
+      add_replica needs postgresql_new_replicas (inventory hostnames) and all of them must be in
+      the postgresql_replica group. Not in the group: {{ __pg_new_replicas | difference(__pg_replica_group) }}
+    quiet: true
+  run_once: true
+  when: postgresql_action == 'add_replica'
+
+# ---------------------------------------------------------------------------
+# promote
+# ---------------------------------------------------------------------------
+
+- name: Preflight | promote input
+  ansible.builtin.assert:
+    that:
+      - postgresql_promote_host | string | length > 0
+      - postgresql_promote_host in __pg_replica_group
+    fail_msg: >-
+      promote needs postgresql_promote_host set to a host of the postgresql_replica group
+      (got '{{ postgresql_promote_host }}', replicas: {{ __pg_replica_group }})
+    quiet: true
+  run_once: true
+  when: postgresql_action == 'promote'
+
+- name: Preflight | promote without fencing
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: postgresql_promote_fence_old_primary=false. If the old primary
+      ({{ __pg_primary_host }}) is still running you will end up with two writable primaries.
+  run_once: true
+  when:
+    - postgresql_action == 'promote'
+    - not (postgresql_promote_fence_old_primary | bool)

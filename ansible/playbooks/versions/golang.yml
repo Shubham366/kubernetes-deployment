@@ -1,0 +1,146 @@
+---
+# Installs or removes the Go toolchain from the official tarball. Several
+# versions can coexist under /usr/local/go-<version>; /usr/local/go points at
+# the active one.
+#
+# Extra vars:
+#   golang_version      e.g. 1.22.5                    (required)
+#   golang_state        present | absent                (default present)
+#   golang_set_default  repoint /usr/local/go           (default true)
+#   golang_download_mirror  default https://go.dev/dl
+#   golang_checksum     e.g. "sha256:..."               (optional)
+- name: Manage the Go toolchain
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: true
+  become: true
+  vars:
+    golang_state: present
+    golang_set_default: true
+    golang_download_mirror: https://go.dev/dl
+    golang_checksum: ""
+    golang_arch: "{{ 'arm64' if ansible_facts.architecture in ['aarch64', 'arm64'] else 'amd64' }}"
+    golang_home: "/usr/local/go-{{ golang_version }}"
+    golang_archive: "go{{ golang_version }}.linux-{{ golang_arch }}.tar.gz"
+  tasks:
+    - name: Validate input
+      ansible.builtin.assert:
+        that:
+          - golang_version is defined
+          - (golang_version | string) is match('^1\.[0-9]+(\.[0-9]+)?$')
+          - golang_state in ['present', 'absent']
+        fail_msg: "golang_version must look like 1.22.5"
+
+    - name: Install Go
+      when: golang_state == 'present'
+      block:
+        - name: Install prerequisites
+          ansible.builtin.package:
+            name: [tar, gzip, ca-certificates, git]
+            state: present
+
+        - name: Check for an existing installation
+          ansible.builtin.stat:
+            path: "{{ golang_home }}/bin/go"
+          register: golang_existing
+
+        - name: Refuse to overwrite a non-managed /usr/local/go directory
+          ansible.builtin.stat:
+            path: /usr/local/go
+          register: golang_link
+
+        - name: Explain the conflict
+          ansible.builtin.fail:
+            msg: >-
+              /usr/local/go exists and is a real directory (not managed by this playbook).
+              Move it away or set golang_set_default=false.
+          when:
+            - golang_set_default | bool
+            - golang_link.stat.exists
+            - not golang_link.stat.islnk
+
+        - name: Create the install directory
+          ansible.builtin.file:
+            path: "{{ golang_home }}"
+            state: directory
+            mode: "0755"
+
+        - name: Download Go
+          ansible.builtin.get_url:
+            url: "{{ golang_download_mirror }}/{{ golang_archive }}"
+            dest: "/tmp/{{ golang_archive }}"
+            mode: "0644"
+            checksum: "{{ golang_checksum | default(omit, true) }}"
+            timeout: 120
+          register: golang_download
+          retries: 3
+          delay: 15
+          until: golang_download is succeeded
+          when: not golang_existing.stat.exists
+
+        - name: Unpack Go
+          ansible.builtin.unarchive:
+            src: "/tmp/{{ golang_archive }}"
+            dest: "{{ golang_home }}"
+            remote_src: true
+            extra_opts: ["--strip-components=1"]
+          when: not golang_existing.stat.exists
+
+        - name: Remove the downloaded archive
+          ansible.builtin.file:
+            path: "/tmp/{{ golang_archive }}"
+            state: absent
+
+        - name: Point /usr/local/go at this version
+          ansible.builtin.file:
+            src: "{{ golang_home }}"
+            dest: /usr/local/go
+            state: link
+            force: true
+          when: golang_set_default | bool
+
+        - name: Add Go to the PATH of login shells
+          ansible.builtin.copy:
+            dest: /etc/profile.d/golang.sh
+            mode: "0644"
+            content: |
+              # Managed by the provisioning backend
+              export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin
+          when: golang_set_default | bool
+
+        - name: Verify Go
+          ansible.builtin.command: "{{ golang_home }}/bin/go version"
+          register: golang_verify
+          changed_when: false
+
+        - name: Check the installed version
+          ansible.builtin.assert:
+            that: golang_verify.stdout is search('go' ~ golang_version)
+            fail_msg: "Expected go{{ golang_version }}, got: {{ golang_verify.stdout }}"
+
+    - name: Remove Go
+      when: golang_state == 'absent'
+      block:
+        - name: Read the current default
+          ansible.builtin.stat:
+            path: /usr/local/go
+          register: golang_link
+
+        - name: Remove the default link if it points at this version
+          ansible.builtin.file:
+            path: /usr/local/go
+            state: absent
+          when:
+            - golang_link.stat.exists
+            - golang_link.stat.islnk
+            - golang_link.stat.lnk_source | default('') == golang_home
+
+        - name: Remove the installation
+          ansible.builtin.file:
+            path: "{{ golang_home }}"
+            state: absent
+
+        - name: Remove the profile snippet when no default is left
+          ansible.builtin.file:
+            path: /etc/profile.d/golang.sh
+            state: absent
+          when: not golang_link.stat.exists or golang_link.stat.lnk_source | default('') == golang_home

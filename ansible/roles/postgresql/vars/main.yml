@@ -1,0 +1,100 @@
+---
+# Internal, derived variables (lazily evaluated per host). Do not override.
+
+# --- topology (groups may be absent from the generated inventory) -------------
+__pg_primary_group: "{{ groups.get('postgresql_primary', []) }}"
+__pg_replica_group: "{{ groups.get('postgresql_replica', []) }}"
+__pg_all_nodes: "{{ (__pg_primary_group + __pg_replica_group) | unique }}"
+
+__pg_is_primary: "{{ inventory_hostname in __pg_primary_group }}"
+__pg_is_replica: "{{ inventory_hostname in __pg_replica_group }}"
+
+__pg_primary_host: "{{ __pg_primary_group | first | default('') }}"
+__pg_primary_addr: >-
+  {{ (hostvars[__pg_primary_host].ansible_host | default(__pg_primary_host))
+     if (__pg_primary_host | length > 0) else '' }}
+__pg_self_addr: "{{ ansible_host | default(inventory_hostname) }}"
+
+# The backend may pass the list as JSON or as a comma separated string.
+__pg_new_replicas: >-
+  {{ (postgresql_new_replicas.split(',') | map('trim') | select | list)
+     if postgresql_new_replicas is string else (postgresql_new_replicas | default([], true)) }}
+
+# --- naming ---------------------------------------------------------------------
+# Used as cluster_name (which a standby reports as its application_name, so it
+# is what synchronous_standby_names refers to) and for the replication slot.
+# Slot names may only contain [a-z0-9_].
+__pg_node_name: "{{ inventory_hostname | lower | regex_replace('[^a-z0-9_]', '_') }}"
+__pg_slot_name: "{{ ('replica_' ~ __pg_node_name)[:63] }}"
+
+# --- paths (the __pg_os_* values come from vars/<os_family>.yml) -----------------
+__pg_version: "{{ postgresql_version | string | regex_replace('\\..*$', '') }}"
+__pg_data_dir: >-
+  {{ postgresql_data_dir if (postgresql_data_dir | default('', true) | string | length > 0)
+     else __pg_os_data_dir }}
+__pg_custom_data_dir: "{{ __pg_data_dir != __pg_os_data_dir }}"
+__pg_conf_dir: "{{ __pg_os_conf_dir }}"
+__pg_conf_file: "{{ __pg_conf_dir }}/postgresql.conf"
+__pg_hba_file: "{{ __pg_conf_dir }}/pg_hba.conf"
+__pg_bin_dir: "{{ __pg_os_bin_dir }}"
+__pg_service: "{{ __pg_os_service }}"
+__pg_home: "{{ __pg_os_home }}"
+__pg_pgpass_file: "{{ __pg_home }}/.pgpass"
+__pg_socket_dir: /var/run/postgresql
+# Marker dropped into a data directory this role initialised on a REPLICA host
+# only so that the config layout exists; such a directory is disposable and
+# may be replaced by a base backup. See tasks/basebackup.yml.
+__pg_seed_marker: "{{ __pg_data_dir }}/.ansible_replica_placeholder"
+
+# --- commands -------------------------------------------------------------------
+# Local superuser session over the unix socket (peer auth), run with
+# become_user: postgres. -X: ignore psqlrc, -At: bare values for parsing.
+__pg_psql_base: >-
+  {{ __pg_bin_dir }}/psql -X -At -v ON_ERROR_STOP=1
+  -h {{ __pg_socket_dir }} -p {{ postgresql_port }}
+__pg_psql: "{{ __pg_psql_base }} -d postgres"
+# Same thing for tasks delegated to the primary, whose OS family (and thus
+# bin dir) may differ from the current host: rely on psql being on the PATH
+# (Debian wrapper / PGDG alternatives both provide /usr/bin/psql).
+__pg_psql_primary: >-
+  psql -X -At -v ON_ERROR_STOP=1
+  -h {{ __pg_socket_dir }} -p {{ postgresql_port }} -d postgres
+# Present while a base backup is running; lets a re-run clean up after an
+# interrupted one (kept outside the data directory on purpose).
+__pg_basebackup_marker: "{{ __pg_home }}/.ansible_basebackup_in_progress_{{ __pg_version }}"
+
+# Password as it must appear in ~/.pgpass: "\" and ":" are backslash-escaped.
+# The backslash comes from a plain YAML value on purpose: inside {{ }} Ansible
+# keeps backslashes in string literals as written, which makes '\\' ambiguous.
+__pg_bs: "\\"
+__pg_pgpass_password: >-
+  {{ postgresql_replication_password | string
+     | replace(__pg_bs, __pg_bs ~ __pg_bs) | replace(':', __pg_bs ~ ':') }}
+
+# --- memory sizing ----------------------------------------------------------------
+__pg_mem_mb: "{{ ansible_memtotal_mb | default(1024) | int }}"
+__pg_shared_buffers: >-
+  {{ (([(__pg_mem_mb | int) // 4, 128] | max) ~ 'MB')
+     if (postgresql_shared_buffers | string | lower == 'auto') else postgresql_shared_buffers }}
+__pg_effective_cache_size: >-
+  {{ (([(__pg_mem_mb | int) * 3 // 4, 256] | max) ~ 'MB')
+     if (postgresql_effective_cache_size | string | lower == 'auto') else postgresql_effective_cache_size }}
+__pg_maintenance_work_mem: >-
+  {{ (([[(__pg_mem_mb | int) // 16, 64] | max, 2047] | min) ~ 'MB')
+     if (postgresql_maintenance_work_mem | string | lower == 'auto') else postgresql_maintenance_work_mem }}
+
+# --- pg_hba helpers -----------------------------------------------------------------
+# Address of this node as the primary will see it, in pg_hba notation:
+# bare IPs get a /32 (/128) mask, DNS names are used as they are.
+__pg_ipv4_re: '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+__pg_self_hba_addr: >-
+  {{ (__pg_self_addr ~ '/32') if (__pg_self_addr is match(__pg_ipv4_re))
+     else ((__pg_self_addr ~ '/128') if (':' in __pg_self_addr) else __pg_self_addr) }}
+__pg_self_hba_line: "host replication {{ postgresql_replication_user }} {{ __pg_self_hba_addr }} {{ postgresql_auth_method }}"
+
+# --- synchronous replication ------------------------------------------------------------
+__pg_sync_standby_names: >-
+  {{ (postgresql_synchronous_method ~ ' ' ~ ([postgresql_synchronous_num | int, __pg_replica_group | length] | min) ~ ' ('
+      ~ (__pg_replica_group | map('lower') | map('regex_replace', '[^a-z0-9_]', '_')
+         | map('regex_replace', '^(.*)$', '"\1"') | join(', ')) ~ ')')
+     if (postgresql_synchronous_replication | bool and __pg_replica_group | length > 0) else '' }}

@@ -1,0 +1,73 @@
+---
+# Roles (users) on the primary, through psql as the postgres OS user.
+#
+# No community.postgresql here, so idempotency is done in SQL:
+#   * a DO block creates the role only when it is missing and raises a NOTICE
+#     that `changed_when` looks for;
+#   * ALTER ROLE then (re)applies attributes and password on every run. That
+#     is not reported as a change (we cannot compare password hashes), but it
+#     guarantees the role ends up as described.
+#
+# SQL is passed on stdin, never on the command line, so passwords do not show
+# up in `ps`; no_log keeps them out of the Ansible output as well.
+
+- name: Roles | postgres superuser password
+  ansible.builtin.command: "{{ __pg_psql }}"
+  args:
+    stdin: "ALTER ROLE postgres WITH PASSWORD '{{ postgresql_superuser_password | string | replace(\"'\", \"''\") }}';"
+  become: true
+  become_user: postgres
+  changed_when: false
+  no_log: true
+  when: postgresql_superuser_password | string | length > 0
+
+- name: Roles | replication role
+  ansible.builtin.command: "{{ __pg_psql }}"
+  args:
+    stdin: |
+      DO $ansible$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = '{{ postgresql_replication_user }}') THEN
+          CREATE ROLE "{{ postgresql_replication_user }}" LOGIN REPLICATION;
+          RAISE NOTICE 'ANSIBLE_ROLE_CREATED';
+        END IF;
+      END
+      $ansible$;
+      ALTER ROLE "{{ postgresql_replication_user }}" WITH LOGIN REPLICATION PASSWORD '{{ postgresql_replication_password | string | replace("'", "''") }}';
+  become: true
+  become_user: postgres
+  register: __pg_repl_role
+  changed_when: "'ANSIBLE_ROLE_CREATED' in __pg_repl_role.stderr"
+  no_log: true
+  when: postgresql_mode == 'replication'
+
+- name: Roles | application users
+  ansible.builtin.command: "{{ __pg_psql }}"
+  args:
+    stdin: |
+      DO $ansible$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = '{{ item.name | replace("'", "''") }}') THEN
+          CREATE ROLE "{{ item.name | replace('"', '""') }}" LOGIN;
+          RAISE NOTICE 'ANSIBLE_ROLE_CREATED';
+        END IF;
+      END
+      $ansible$;
+      ALTER ROLE "{{ item.name | replace('"', '""') }}" WITH LOGIN
+        {{ 'SUPERUSER' if item.superuser | default(false) | bool else 'NOSUPERUSER' }}
+        {{ 'CREATEDB' if item.createdb | default(false) | bool else 'NOCREATEDB' }}
+        {% if item.password | default('', true) | string | length > 0 %}PASSWORD '{{ item.password | string | replace("'", "''") }}'{% endif %};
+  become: true
+  become_user: postgres
+  loop: "{{ postgresql_users }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: __pg_users
+  changed_when: "'ANSIBLE_ROLE_CREATED' in __pg_users.stderr"
+  no_log: true
+
+- name: Roles | summary
+  ansible.builtin.debug:
+    msg: >-
+      roles ensured: {{ postgresql_users | map(attribute='name') | list }}
+      {{ '+ replication role ' ~ postgresql_replication_user if postgresql_mode == 'replication' else '' }}

@@ -1,0 +1,80 @@
+---
+# Installs the redis binaries (package or source) and the things both methods
+# share: service account and directories. Used by data nodes and by sentinels.
+
+- name: Install | via distro package
+  ansible.builtin.include_tasks: install_package.yml
+  when: redis_install_method == 'package'
+
+- name: Install | from source
+  ansible.builtin.include_tasks: install_source.yml
+  when: redis_install_method == 'source'
+
+# The distro packages create their own `redis` account; only create one when
+# it is missing so we never rewrite the home/shell of a packaged account.
+- name: Install | does the service account exist
+  ansible.builtin.command: "id -u {{ redis_user }}"
+  register: __redis_user_check
+  changed_when: false
+  failed_when: false
+
+- name: Install | service group
+  ansible.builtin.group:
+    name: "{{ redis_group }}"
+    system: true
+  when: __redis_user_check.rc != 0
+
+- name: Install | service account
+  ansible.builtin.user:
+    name: "{{ redis_user }}"
+    group: "{{ redis_group }}"
+    system: true
+    shell: "{{ __redis_os_nologin }}"
+    home: "{{ redis_data_dir }}"
+    create_home: false
+    comment: Redis server
+  when: __redis_user_check.rc != 0
+
+# The config directory must be writable by redis: CONFIG REWRITE, sentinel
+# and cluster all rewrite their files in place (atomically, via a temp file).
+- name: Install | directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ redis_user }}"
+    group: "{{ redis_group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ redis_conf_dir }}", mode: "0750" }
+    - { path: "{{ redis_data_dir }}", mode: "0750" }
+    - { path: "{{ redis_log_dir }}", mode: "0750" }
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Install | logrotate
+  ansible.builtin.copy:
+    dest: /etc/logrotate.d/redis-ansible
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible (redis role)
+      {{ redis_log_dir }}/*.log {
+          weekly
+          rotate 8
+          missingok
+          notifempty
+          compress
+          delaycompress
+          copytruncate
+      }
+  when: redis_manage_logrotate | bool
+
+- name: Install | installed version
+  ansible.builtin.command: "{{ __redis_server_bin }} --version"
+  register: __redis_installed_version
+  changed_when: false
+
+- name: Install | show installed version
+  ansible.builtin.debug:
+    msg: "{{ __redis_installed_version.stdout }}"

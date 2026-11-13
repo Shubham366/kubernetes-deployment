@@ -1,0 +1,24 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Apache ZooKeeper {{ hadoop_zookeeper_version }} ({{ hadoop_cluster_name }})
+Documentation=https://zookeeper.apache.org/
+Wants=network-online.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=simple
+User={{ hadoop_zookeeper_user }}
+Group={{ hadoop_zookeeper_group }}
+Environment=ZOOCFGDIR={{ hadoop_zookeeper_conf_dir }}
+Environment=ZOO_LOG_DIR={{ hadoop_zookeeper_log_dir }}
+Environment=JAVA_HOME={{ hadoop_java_home_resolved }}
+WorkingDirectory={{ hadoop_zookeeper_data_dir }}
+ExecStart={{ hadoop_zk_current }}/bin/zkServer.sh --config {{ hadoop_zookeeper_conf_dir }} start-foreground
+SuccessExitStatus=143
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=60
+LimitNOFILE={{ hadoop_nofile_limit }}
+
+[Install]
+WantedBy=multi-user.target

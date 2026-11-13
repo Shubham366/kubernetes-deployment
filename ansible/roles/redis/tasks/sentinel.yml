@@ -1,0 +1,153 @@
+---
+# Redis Sentinel on a host of the redis_sentinel group. The host may or may
+# not also be a data node, so the binaries are (idempotently) installed here
+# as well.
+
+- name: Sentinel | load variables
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Sentinel | a master must be defined
+  ansible.builtin.assert:
+    that:
+      - __redis_master_addr | length > 0
+    fail_msg: "sentinel mode needs a host in the redis_master group to monitor"
+    quiet: true
+
+- name: Sentinel | kernel tuning
+  ansible.builtin.include_tasks: kernel.yml
+  when:
+    - redis_manage_kernel | bool
+    - not (__redis_is_data_node | bool)   # data nodes already did this
+
+- name: Sentinel | install binaries
+  ansible.builtin.include_tasks: install.yml
+
+- name: Sentinel | firewall
+  ansible.builtin.include_tasks: firewall.yml
+  vars:
+    __redis_fw_state: open
+  when: redis_manage_firewall | bool
+
+- name: Sentinel | SELinux
+  ansible.builtin.include_tasks: selinux.yml
+  when:
+    - redis_manage_selinux | bool
+    - ansible_os_family == 'RedHat'
+
+- name: Sentinel | working directory
+  ansible.builtin.file:
+    path: "{{ __redis_sentinel_dir }}"
+    state: directory
+    owner: "{{ redis_user }}"
+    group: "{{ redis_group }}"
+    mode: "0750"
+
+# Sentinel rewrites its config file at runtime (known replicas, other
+# sentinels, epochs, the *current* master). Templating straight onto the live
+# file would report "changed" on every run and wipe that state. So the
+# template goes to a hidden seed file, and the live file is only (re)created
+# from it when:
+#   * it does not exist yet (first install), or
+#   * redis_force_reconfigure=true and the seed changed.
+- name: Sentinel | render seed configuration
+  ansible.builtin.template:
+    src: sentinel.conf.j2
+    dest: "{{ __redis_sentinel_seed_file }}"
+    owner: "{{ redis_user }}"
+    group: "{{ redis_group }}"
+    mode: "0640"
+  diff: false   # contains sentinel auth-pass
+  register: __redis_sentinel_seed
+
+- name: Sentinel | live configuration present?
+  ansible.builtin.stat:
+    path: "{{ __redis_sentinel_conf_file }}"
+  register: __redis_sentinel_live
+
+- name: Sentinel | create live configuration from the seed
+  ansible.builtin.copy:
+    src: "{{ __redis_sentinel_seed_file }}"
+    dest: "{{ __redis_sentinel_conf_file }}"
+    remote_src: true
+    owner: "{{ redis_user }}"
+    group: "{{ redis_group }}"
+    mode: "0640"
+  diff: false
+  notify: Restart redis sentinel
+  when: >-
+    not __redis_sentinel_live.stat.exists
+    or (redis_force_reconfigure | bool and __redis_sentinel_seed is changed)
+
+- name: Sentinel | seed changed but live configuration kept
+  ansible.builtin.debug:
+    msg: >-
+      Sentinel settings changed but {{ __redis_sentinel_conf_file }} already exists and is owned
+      by sentinel; not overwriting it. Re-run with redis_force_reconfigure=true to apply
+      (sentinel will re-discover replicas and other sentinels).
+  when:
+    - __redis_sentinel_live.stat.exists
+    - __redis_sentinel_seed is changed
+    - not (redis_force_reconfigure | bool)
+
+- name: Sentinel | systemd unit
+  ansible.builtin.template:
+    src: redis-sentinel.service.j2
+    dest: "{{ __redis_sentinel_unit_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd for redis
+    - Restart redis sentinel
+
+- name: Sentinel | schedule restart after binary upgrade
+  ansible.builtin.debug:
+    msg: "redis binaries changed, {{ __redis_sentinel_service }} will be restarted"
+  changed_when: true
+  notify: Restart redis sentinel
+  when: __redis_binary_changed_sentinel | default(false) | bool
+
+- name: Sentinel | binary upgrade handled
+  ansible.builtin.set_fact:
+    __redis_binary_changed_sentinel: false
+
+- name: Sentinel | apply pending restarts
+  ansible.builtin.meta: flush_handlers
+
+- name: Sentinel | enable and start
+  ansible.builtin.systemd:
+    name: "{{ __redis_sentinel_service }}"
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Sentinel | wait for the port
+  ansible.builtin.wait_for:
+    host: "{{ __redis_cli_host }}"
+    port: "{{ redis_sentinel_port | int }}"
+    timeout: 60
+
+# `sentinel master <name>` returns a flat key/value list; "flags" must be
+# plain "master" (not s_down / o_down) once the sentinel reached the master.
+- name: Sentinel | wait until the master is seen as healthy
+  ansible.builtin.command: "{{ __redis_sentinel_cli }} sentinel master {{ redis_sentinel_master_name }}"
+  register: __redis_sentinel_master
+  changed_when: false
+  retries: 30
+  delay: 2
+  until:
+    - __redis_sentinel_master.rc == 0
+    - "'s_down' not in __redis_sentinel_master.stdout"
+    - "'o_down' not in __redis_sentinel_master.stdout"
+
+- name: Sentinel | current master address
+  ansible.builtin.command: "{{ __redis_sentinel_cli }} sentinel get-master-addr-by-name {{ redis_sentinel_master_name }}"
+  register: __redis_sentinel_addr
+  changed_when: false
+
+- name: Sentinel | summary
+  ansible.builtin.debug:
+    msg: >-
+      sentinel {{ inventory_hostname }}:{{ redis_sentinel_port }} monitors
+      '{{ redis_sentinel_master_name }}' at {{ __redis_sentinel_addr.stdout_lines | join(':') }}
+      (quorum {{ __redis_sentinel_quorum | trim }}/{{ __redis_sentinel_group | length }})

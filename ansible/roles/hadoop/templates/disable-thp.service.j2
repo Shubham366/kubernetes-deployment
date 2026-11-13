@@ -1,0 +1,16 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Disable Transparent Huge Pages (Hadoop tuning)
+DefaultDependencies=no
+After=sysinit.target local-fs.target
+Before=basic.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# "$$" is systemd's escape for a literal "$". Missing or read-only sysfs
+# entries (containers) are skipped instead of failing the unit.
+ExecStart=/bin/sh -c 'for f in enabled defrag; do if [ -w /sys/kernel/mm/transparent_hugepage/$$f ]; then echo never > /sys/kernel/mm/transparent_hugepage/$$f; fi; done'
+
+[Install]
+WantedBy=basic.target

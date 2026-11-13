@@ -1,0 +1,115 @@
+---
+# =============================================================================
+# Java
+#
+# Installs the distro OpenJDK (headless JDK - jps/jstack are needed for
+# operations) unless hadoop_java_home points at an existing JDK, then resolves
+# JAVA_HOME into the fact hadoop_java_home_resolved, which the templates
+# (hadoop-env.sh, profile.d, zookeeper java.env/unit) consume.
+#
+#   Debian family: openjdk-<v>-jdk-headless   -> /usr/lib/jvm/java-<v>-openjdk-<arch>
+#   RedHat family: java-<v>-openjdk-devel     -> /usr/lib/jvm/java-<v>-openjdk
+#                  (Java 8 is "1.8.0" there)
+# =============================================================================
+
+- name: Java | Use the JDK given in hadoop_java_home
+  when: hadoop_java_home | default('', true) | length > 0
+  block:
+    - name: Java | Check the provided JAVA_HOME
+      ansible.builtin.stat:
+        path: "{{ hadoop_java_home }}/bin/java"
+      register: hadoop_java_override_stat
+
+    - name: Java | The provided JAVA_HOME must contain bin/java
+      ansible.builtin.assert:
+        that:
+          - hadoop_java_override_stat.stat.exists
+          - hadoop_java_override_stat.stat.executable
+        fail_msg: "hadoop_java_home={{ hadoop_java_home }} has no executable bin/java on {{ inventory_hostname }}."
+        quiet: true
+
+    - name: Java | Record JAVA_HOME
+      ansible.builtin.set_fact:
+        hadoop_java_home_resolved: "{{ hadoop_java_home }}"
+
+- name: Java | Install OpenJDK from the distribution
+  when: hadoop_java_home | default('', true) | length == 0
+  block:
+    # Fail with a useful message instead of apt's "Unable to locate package".
+    - name: Java | Check that the JDK package exists (Debian family)
+      ansible.builtin.command:
+        cmd: "apt-cache show {{ hadoop_java_effective_package }}"
+      register: hadoop_java_pkg_check
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: ansible_os_family == 'Debian'
+
+    - name: Java | JDK package is not available on this release
+      ansible.builtin.fail:
+        msg: >-
+          Package '{{ hadoop_java_effective_package }}' is not available on
+          {{ ansible_distribution }} {{ ansible_distribution_version }}
+          ({{ inventory_hostname }}). Options: choose a hadoop_java_version this
+          release ships (Debian 12: 17; Debian 11: 11/17; Ubuntu 20.04: 8/11/17;
+          Ubuntu 22.04+: 8/11/17/21), add a repository that provides it and set
+          hadoop_java_package, or install a JDK yourself and set hadoop_java_home.
+      when:
+        - ansible_os_family == 'Debian'
+        - hadoop_java_pkg_check.rc | default(0) != 0
+
+    - name: Java | Install the JDK (Debian family)
+      ansible.builtin.apt:
+        name: "{{ hadoop_java_effective_package }}"
+        state: present
+        install_recommends: false
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      when: ansible_os_family == 'Debian'
+      register: hadoop_java_install_deb
+      retries: 3
+      delay: 10
+      until: hadoop_java_install_deb is succeeded
+
+    - name: Java | Install the JDK (RedHat family)
+      ansible.builtin.package:
+        name: "{{ hadoop_java_effective_package }}"
+        state: present
+      when: ansible_os_family == 'RedHat'
+      register: hadoop_java_install_rh
+      retries: 3
+      delay: 10
+      until: hadoop_java_install_rh is succeeded
+
+    # Well-known locations first, then any matching directory under
+    # /usr/lib/jvm, finally whatever `java` on the PATH resolves to.
+    - name: Java | Resolve JAVA_HOME
+      ansible.builtin.shell: |
+        for d in {{ hadoop_java_home_candidates[ansible_os_family] | map('quote') | join(' ') }}; do
+          if [ -x "$d/bin/java" ]; then echo "$d"; exit 0; fi
+        done
+        for d in /usr/lib/jvm/*java-{{ hadoop_java_glob_label }}-openjdk*; do
+          if [ -x "$d/bin/java" ]; then echo "$d"; exit 0; fi
+        done
+        j=$(command -v java 2>/dev/null) || exit 1
+        dirname "$(dirname "$(readlink -f "$j")")"
+      args:
+        executable: /bin/sh
+      register: hadoop_java_home_lookup
+      changed_when: false
+      check_mode: false
+
+    - name: Java | Record JAVA_HOME
+      ansible.builtin.set_fact:
+        hadoop_java_home_resolved: "{{ hadoop_java_home_lookup.stdout_lines | first | trim }}"
+
+- name: Java | Verify the JVM starts
+  ansible.builtin.command:
+    cmd: "{{ hadoop_java_home_resolved }}/bin/java -version"
+  register: hadoop_java_version_out
+  changed_when: false
+  check_mode: false
+
+- name: Java | Show the JVM in use
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }}: JAVA_HOME={{ hadoop_java_home_resolved }} - {{ (hadoop_java_version_out.stderr_lines + hadoop_java_version_out.stdout_lines) | first | default('') }}"

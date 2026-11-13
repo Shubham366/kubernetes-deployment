@@ -1,0 +1,189 @@
+---
+# =============================================================================
+# NameNode bring-up (install / start) - runs on one NameNode host at a time.
+#
+# The playbook calls this first for the primary NameNode, then (HA) for each
+# remaining NameNode with serial: 1.
+#
+# Decision table for a host whose metadata directory is EMPTY:
+#
+#   no NameNode anywhere is formatted, this is the primary,
+#   action=install and hadoop_format_namenode=true      -> hdfs namenode -format
+#   HA and another NameNode already holds metadata      -> bootstrapStandby
+#   anything else                                       -> fail, explain
+#
+# A host that already holds metadata is NEVER formatted or bootstrapped again.
+# "Holds metadata" = <name_dir>/current/VERSION exists in any name directory,
+# or the marker file written after the first format is present. On top of
+# that both commands run with -nonInteractive, which makes Hadoop itself
+# abort instead of overwriting existing data.
+#
+# HA start order on the primary:  format -> formatZK -> NameNode -> ZKFC
+# (ZKFC wins the election and makes it active) and only then are the standbys
+# bootstrapped from it.
+# =============================================================================
+
+- name: NameNode | Look for existing metadata on this host
+  ansible.builtin.stat:
+    path: "{{ item }}/current/VERSION"
+  loop: "{{ hadoop_nn_dirs }}"
+  register: hadoop_nn_version_stat
+
+- name: NameNode | Look for the format marker
+  ansible.builtin.stat:
+    path: "{{ hadoop_format_marker }}"
+  register: hadoop_nn_marker_stat
+
+# Protects against formatting a *replacement* primary while the other
+# NameNode still holds the real namespace.
+- name: NameNode | Look for existing metadata on the other NameNodes
+  ansible.builtin.stat:
+    path: "{{ hadoop_nn_dirs | first }}/current/VERSION"
+  delegate_to: "{{ item }}"
+  loop: "{{ hadoop_nn_hosts | difference([inventory_hostname]) }}"
+  register: hadoop_nn_peer_stat
+
+- name: NameNode | Decide what has to happen
+  ansible.builtin.set_fact:
+    hadoop_nn_self_formatted: >-
+      {{ (hadoop_nn_version_stat.results | selectattr('stat', 'defined') | selectattr('stat.exists') | list | length > 0)
+         or hadoop_nn_marker_stat.stat.exists }}
+    hadoop_nn_peer_formatted: >-
+      {{ hadoop_nn_peer_stat.results | default([]) | selectattr('stat', 'defined') | selectattr('stat.exists') | list | length > 0 }}
+
+- name: NameNode | Plan
+  ansible.builtin.set_fact:
+    hadoop_nn_do_format: >-
+      {{ hadoop_action == 'install'
+         and (hadoop_format_namenode | bool)
+         and inventory_hostname == hadoop_primary_nn
+         and not (hadoop_nn_self_formatted | bool)
+         and not (hadoop_nn_peer_formatted | bool) }}
+    hadoop_nn_do_bootstrap: >-
+      {{ hadoop_action == 'install'
+         and (hadoop_ha | bool)
+         and not (hadoop_nn_self_formatted | bool)
+         and (hadoop_nn_peer_formatted | bool) }}
+
+- name: NameNode | Show the plan
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: metadata present here={{ hadoop_nn_self_formatted }},
+      on another NameNode={{ hadoop_nn_peer_formatted }} ->
+      {{ 'FORMAT (first install)' if hadoop_nn_do_format | bool
+         else ('BOOTSTRAP STANDBY' if hadoop_nn_do_bootstrap | bool else 'start with existing metadata') }}
+
+- name: NameNode | Refuse to start a NameNode without metadata
+  ansible.builtin.fail:
+    msg: >-
+      {{ inventory_hostname }} has no NameNode metadata in {{ hadoop_nn_dirs | join(', ') }}
+      and it will not be created automatically
+      (action={{ hadoop_action }}, hadoop_format_namenode={{ hadoop_format_namenode }},
+      primary={{ inventory_hostname == hadoop_primary_nn }}, HA={{ hadoop_ha }},
+      metadata on another NameNode={{ hadoop_nn_peer_formatted }}).
+      Formatting only happens for hadoop_action=install with
+      hadoop_format_namenode=true on a cluster where no NameNode is formatted;
+      restore the metadata directory or run the install action.
+  when:
+    - not (hadoop_nn_self_formatted | bool)
+    - not (hadoop_nn_do_format | bool)
+    - not (hadoop_nn_do_bootstrap | bool)
+
+# ---------------------------------------------------------------------------
+# First install: format. In HA this also initialises the JournalNodes' shared
+# edits directory, so a quorum of JournalNodes must already be running (the
+# playbook starts them in the previous play).
+# ---------------------------------------------------------------------------
+- name: NameNode | Format HDFS (first install only)
+  ansible.builtin.command:
+    cmd: "{{ hadoop_hdfs }} namenode -format -clusterId {{ hadoop_cluster_id }} -nonInteractive"
+  become: true
+  become_user: "{{ hadoop_user }}"
+  when: hadoop_nn_do_format | bool
+  register: hadoop_nn_format
+  changed_when: true
+
+# ---------------------------------------------------------------------------
+# HA standby: copy the namespace from the running active NameNode.
+# ---------------------------------------------------------------------------
+- name: NameNode | Bootstrap the standby from the active NameNode
+  ansible.builtin.command:
+    cmd: "{{ hadoop_hdfs }} namenode -bootstrapStandby -nonInteractive"
+  become: true
+  become_user: "{{ hadoop_user }}"
+  when: hadoop_nn_do_bootstrap | bool
+  register: hadoop_nn_bootstrap
+  changed_when: true
+  retries: 5
+  delay: 15
+  until: hadoop_nn_bootstrap.rc == 0
+
+- name: NameNode | Write the format marker
+  ansible.builtin.copy:
+    dest: "{{ hadoop_format_marker }}"
+    owner: root
+    group: root
+    mode: "0444"
+    force: false
+    content: |
+      # Written by ansible (hadoop role). While this file exists the NameNode
+      # on this host will never be formatted or bootstrapped again.
+      cluster={{ hadoop_cluster_name }}
+      host={{ inventory_hostname }}
+      method={{ 'format' if hadoop_nn_do_format | bool else ('bootstrapStandby' if hadoop_nn_do_bootstrap | bool else 'pre-existing') }}
+  when: (hadoop_nn_self_formatted | bool) or (hadoop_nn_do_format | bool) or (hadoop_nn_do_bootstrap | bool)
+
+# ---------------------------------------------------------------------------
+# HA: create the election znode. Exit code 2 = "znode already exists and
+# -nonInteractive forbids overwriting it" -> already initialised, fine.
+# ---------------------------------------------------------------------------
+- name: NameNode | Initialise the HA state in ZooKeeper (formatZK)
+  ansible.builtin.command:
+    cmd: "{{ hadoop_hdfs }} zkfc -formatZK -nonInteractive"
+  become: true
+  become_user: "{{ hadoop_user }}"
+  when:
+    - hadoop_ha | bool
+    - hadoop_action == 'install'
+    - inventory_hostname == hadoop_primary_nn
+  register: hadoop_zkfc_format
+  changed_when: hadoop_zkfc_format.rc == 0
+  failed_when: hadoop_zkfc_format.rc not in [0, 2]
+
+# ---------------------------------------------------------------------------
+# Start
+# ---------------------------------------------------------------------------
+- name: NameNode | Start the NameNode
+  ansible.builtin.include_tasks: services.yml
+  vars:
+    hadoop_svc_daemons: [namenode]
+    hadoop_svc_state: "{{ hadoop_start_state }}"
+
+- name: NameNode | Start the ZK failover controller
+  ansible.builtin.include_tasks: services.yml
+  vars:
+    hadoop_svc_daemons: [zkfc]
+    hadoop_svc_state: "{{ hadoop_start_state }}"
+  when: hadoop_ha | bool
+
+# The standbys bootstrap from the active NameNode, so do not move on before
+# the election has actually produced one.
+- name: NameNode | Wait for an active NameNode
+  ansible.builtin.command:
+    cmd: "{{ hadoop_hdfs }} haadmin -getAllServiceState"
+  become: true
+  become_user: "{{ hadoop_user }}"
+  register: hadoop_ha_state
+  changed_when: false
+  failed_when: "'active' not in hadoop_ha_state.stdout"
+  until: "'active' in hadoop_ha_state.stdout"
+  retries: 36
+  delay: 5
+  when: hadoop_ha | bool
+
+- name: NameNode | Start the SecondaryNameNode (non-HA)
+  ansible.builtin.include_tasks: services.yml
+  vars:
+    hadoop_svc_daemons: [secondarynamenode]
+    hadoop_svc_state: "{{ hadoop_start_state }}"
+  when: not (hadoop_ha | bool)

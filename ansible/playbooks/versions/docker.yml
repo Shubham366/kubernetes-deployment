@@ -1,0 +1,261 @@
+---
+# Installs or removes Docker Engine from Docker's own repositories.
+#
+# Extra vars:
+#   docker_version      "latest" or a major.minor line such as "26.1"   (default latest)
+#   docker_state        present | absent                                   (default present)
+#   docker_users        users added to the docker group                    (default [])
+#   docker_daemon_config  dict merged into /etc/docker/daemon.json         (default log rotation)
+#   docker_data_root    optional data-root
+#   docker_purge_data   on removal also delete /var/lib/docker             (default false)
+- name: Manage Docker Engine
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: true
+  become: true
+  vars:
+    docker_version: latest
+    docker_state: present
+    docker_users: []
+    docker_purge_data: false
+    docker_data_root: ""
+    docker_daemon_config: {}
+    docker_default_daemon_config:
+      log-driver: json-file
+      log-opts:
+        max-size: 100m
+        max-file: "3"
+    docker_is_debian: "{{ ansible_facts.os_family == 'Debian' }}"
+    docker_el_major: "{{ ansible_facts.distribution_major_version | int }}"
+    docker_pin: "{{ (docker_version | string) != 'latest' }}"
+    docker_apt_distro: "{{ 'ubuntu' if ansible_facts.distribution == 'Ubuntu' else 'debian' }}"
+    # Docker publishes RHEL packages only for some architectures/releases; the
+    # CentOS repository works on every EL clone.
+    docker_rpm_distro: "{{ 'rhel' if (ansible_facts.distribution == 'RedHat' and docker_el_major | int >= 8) else 'centos' }}"
+    docker_packages:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+    docker_conflicting_debian: [docker.io, docker-doc, docker-compose, podman-docker, containerd, runc]
+    docker_conflicting_redhat: [docker, docker-client, docker-common, docker-latest, docker-engine, podman, buildah, runc]
+  tasks:
+    - name: Validate input
+      ansible.builtin.assert:
+        that:
+          - docker_state in ['present', 'absent']
+          - (docker_version | string) == 'latest' or (docker_version | string) is match('^[0-9]+\.[0-9]+(\.[0-9]+)?$')
+          - ansible_facts.os_family in ['Debian', 'RedHat']
+        fail_msg: "docker_version must be 'latest' or look like 26.1"
+
+    # --------------------------------------------------------------- Debian
+    - name: Install Docker (Debian family)
+      when:
+        - docker_state == 'present'
+        - docker_is_debian
+      block:
+        - name: Remove conflicting distribution packages
+          ansible.builtin.apt:
+            name: "{{ docker_conflicting_debian }}"
+            state: absent
+
+        - name: Install repository prerequisites
+          ansible.builtin.apt:
+            name: [ca-certificates, curl, gnupg]
+            state: present
+            update_cache: true
+            cache_valid_time: 3600
+
+        - name: Create the keyring directory
+          ansible.builtin.file:
+            path: /etc/apt/keyrings
+            state: directory
+            mode: "0755"
+
+        - name: Install Docker's signing key
+          ansible.builtin.get_url:
+            url: "https://download.docker.com/linux/{{ docker_apt_distro }}/gpg"
+            dest: /etc/apt/keyrings/docker.asc
+            mode: "0644"
+          register: docker_key
+          retries: 3
+          delay: 10
+          until: docker_key is succeeded
+
+        - name: Configure the Docker repository
+          ansible.builtin.copy:
+            dest: /etc/apt/sources.list.d/docker.list
+            mode: "0644"
+            content: |
+              deb [arch={{ 'arm64' if ansible_facts.architecture in ['aarch64', 'arm64'] else 'amd64' }} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/{{ docker_apt_distro }} {{ ansible_facts.distribution_release }} stable
+          register: docker_repo
+
+        - name: Refresh the apt cache after a repository change
+          ansible.builtin.apt:
+            update_cache: true
+          when: docker_repo is changed
+
+        - name: Find the newest package of the requested line
+          ansible.builtin.shell: >-
+            set -o pipefail;
+            apt-cache madison docker-ce | awk '{print $3}' | grep -E '^[0-9]+:{{ docker_version | regex_escape }}[.~-]' | head -n1
+          args:
+            executable: /bin/bash
+          register: docker_apt_version
+          changed_when: false
+          failed_when: false
+          when: docker_pin | bool
+
+        - name: Fail when the requested line is not published for this release
+          ansible.builtin.fail:
+            msg: >-
+              Docker {{ docker_version }} is not available for {{ ansible_facts.distribution }}
+              {{ ansible_facts.distribution_release }}. Available lines:
+              run 'apt-cache madison docker-ce' on the host.
+          when:
+            - docker_pin | bool
+            - docker_apt_version.stdout | default('') | length == 0
+
+        - name: Install Docker packages
+          ansible.builtin.apt:
+            name: >-
+              {{ (['docker-ce=' ~ docker_apt_version.stdout, 'docker-ce-cli=' ~ docker_apt_version.stdout]
+                  + docker_packages[2:]) if docker_pin | bool else docker_packages }}
+            state: present
+            allow_downgrade: true
+
+        - name: Hold the pinned version
+          ansible.builtin.dpkg_selections:
+            name: "{{ item }}"
+            selection: "{{ 'hold' if docker_pin | bool else 'install' }}"
+          loop: [docker-ce, docker-ce-cli]
+
+    # --------------------------------------------------------------- RedHat
+    - name: Install Docker (RedHat family)
+      when:
+        - docker_state == 'present'
+        - not docker_is_debian
+      block:
+        - name: Remove conflicting packages
+          ansible.builtin.package:
+            name: "{{ docker_conflicting_redhat }}"
+            state: absent
+
+        - name: Configure the Docker repository
+          ansible.builtin.yum_repository:
+            name: docker-ce-stable
+            description: Docker CE Stable
+            baseurl: "https://download.docker.com/linux/{{ docker_rpm_distro }}/$releasever/$basearch/stable"
+            gpgcheck: true
+            gpgkey: "https://download.docker.com/linux/{{ docker_rpm_distro }}/gpg"
+            enabled: true
+
+        - name: Install Docker packages
+          ansible.builtin.package:
+            name: >-
+              {{ (['docker-ce-' ~ docker_version ~ '*', 'docker-ce-cli-' ~ docker_version ~ '*']
+                  + docker_packages[2:]) if docker_pin | bool else docker_packages }}
+            state: present
+          register: docker_rpm
+          retries: 2
+          delay: 10
+          until: docker_rpm is succeeded
+
+    # --------------------------------------------------------- configuration
+    - name: Configure and start Docker
+      when: docker_state == 'present'
+      block:
+        - name: Create /etc/docker
+          ansible.builtin.file:
+            path: /etc/docker
+            state: directory
+            mode: "0755"
+
+        - name: Write daemon.json
+          ansible.builtin.copy:
+            dest: /etc/docker/daemon.json
+            mode: "0644"
+            content: >-
+              {{ docker_default_daemon_config
+                 | combine({'data-root': docker_data_root} if docker_data_root | length > 0 else {})
+                 | combine(docker_daemon_config, recursive=true) | to_nice_json }}
+          register: docker_daemon_json
+
+        - name: Enable and start containerd and docker
+          ansible.builtin.systemd:
+            name: "{{ item }}"
+            state: started
+            enabled: true
+            daemon_reload: true
+          loop: [containerd, docker]
+
+        - name: Restart Docker after a configuration change
+          ansible.builtin.systemd:
+            name: docker
+            state: restarted
+          when: docker_daemon_json is changed
+
+        - name: Add users to the docker group
+          ansible.builtin.user:
+            name: "{{ item }}"
+            groups: docker
+            append: true
+          loop: "{{ docker_users }}"
+
+        - name: Verify the daemon answers
+          ansible.builtin.command: docker version --format '{{ "{{" }}.Server.Version{{ "}}" }}'
+          register: docker_verify
+          changed_when: false
+          retries: 5
+          delay: 3
+          until: docker_verify.rc == 0
+
+        - name: Check the installed line
+          ansible.builtin.assert:
+            that: docker_verify.stdout is match('^' ~ (docker_version | regex_escape))
+            fail_msg: "Expected Docker {{ docker_version }}.x but the daemon reports {{ docker_verify.stdout }}"
+          when: docker_pin | bool
+
+    # -------------------------------------------------------------- removal
+    - name: Remove Docker
+      when: docker_state == 'absent'
+      block:
+        - name: Stop docker and containerd
+          ansible.builtin.systemd:
+            name: "{{ item }}"
+            state: stopped
+            enabled: false
+          loop: [docker.socket, docker, containerd]
+          failed_when: false
+
+        - name: Release package holds
+          ansible.builtin.dpkg_selections:
+            name: "{{ item }}"
+            selection: install
+          loop: [docker-ce, docker-ce-cli]
+          when: docker_is_debian
+          failed_when: false
+
+        - name: Remove Docker packages
+          ansible.builtin.package:
+            name: "{{ docker_packages + ['docker-ce-rootless-extras'] }}"
+            state: absent
+
+        - name: Remove repository configuration
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - /etc/apt/sources.list.d/docker.list
+            - /etc/apt/keyrings/docker.asc
+            - /etc/yum.repos.d/docker-ce-stable.repo
+
+        - name: Delete images, containers and volumes
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - /var/lib/docker
+            - /var/lib/containerd
+            - /etc/docker
+          when: docker_purge_data | bool

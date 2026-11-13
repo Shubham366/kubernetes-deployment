@@ -1,0 +1,116 @@
+---
+# =============================================================================
+# Host firewall
+#
+# RedHat family normally runs firewalld, Debian family ufw - but either can be
+# installed on either, so both are *detected* instead of assumed. Nothing is
+# installed or enabled here: an inactive firewall is left inactive.
+#
+# No collections are used, so idempotency is done by hand:
+#   firewalld: --query-* first, add only when missing, print a marker
+#   ufw:       "Skipping adding existing rule" in the output means unchanged
+#
+# hadoop_firewall_allowed_sources = []      -> ports open to any source
+# hadoop_firewall_allowed_sources = [cidr]  -> one rule per (source, port)
+# =============================================================================
+
+- name: Firewall | Ports required by the daemons of this host
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} ({{ hadoop_host_daemons | join(', ') }}): tcp {{ hadoop_host_firewall_ports | join(', ') }}"
+
+- name: Firewall | Detect firewalld
+  ansible.builtin.command:
+    cmd: systemctl is-active firewalld
+  register: hadoop_firewalld_active
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Firewall | Detect ufw
+  ansible.builtin.shell: |
+    command -v ufw >/dev/null 2>&1 || exit 0
+    ufw status 2>/dev/null | head -n 1
+  args:
+    executable: /bin/sh
+  register: hadoop_ufw_status
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Firewall | Record what is active
+  ansible.builtin.set_fact:
+    hadoop_fw_firewalld: "{{ (hadoop_firewalld_active.stdout | default('') | trim) == 'active' }}"
+    hadoop_fw_ufw: "{{ 'Status: active' in (hadoop_ufw_status.stdout | default('')) }}"
+    hadoop_fw_zone_arg: "{{ ('--zone=' ~ hadoop_firewalld_zone) if (hadoop_firewalld_zone | default('', true) | length > 0) else '' }}"
+    hadoop_fw_sources: "{{ hadoop_firewall_allowed_sources | default([], true) }}"
+
+- name: Firewall | No active host firewall
+  ansible.builtin.debug:
+    msg: "Neither firewalld nor ufw is active on {{ inventory_hostname }} - nothing to open."
+  when:
+    - not hadoop_fw_firewalld
+    - not hadoop_fw_ufw
+
+# ---------------------------------------------------------------------------
+# firewalld
+# ---------------------------------------------------------------------------
+# firewalld takes ranges as "50100-50200/tcp", which is how the range is stored.
+- name: Firewall | firewalld - open ports (any source)
+  ansible.builtin.shell: |
+    if firewall-cmd --permanent {{ hadoop_fw_zone_arg }} --query-port={{ item }}/tcp >/dev/null 2>&1; then
+      exit 0
+    fi
+    firewall-cmd --permanent {{ hadoop_fw_zone_arg }} --add-port={{ item }}/tcp && echo HADOOP_FW_CHANGED
+  args:
+    executable: /bin/sh
+  loop: "{{ hadoop_host_firewall_ports }}"
+  register: hadoop_fw_result
+  changed_when: "'HADOOP_FW_CHANGED' in hadoop_fw_result.stdout"
+  notify: hadoop firewalld reload
+  when:
+    - hadoop_fw_firewalld
+    - hadoop_fw_sources | length == 0
+
+- name: Firewall | firewalld - open ports (restricted sources)
+  ansible.builtin.shell: |
+    rule='rule family="{{ 'ipv6' if ':' in item.1 else 'ipv4' }}" source address="{{ item.1 }}" port port="{{ item.0 }}" protocol="tcp" accept'
+    if firewall-cmd --permanent {{ hadoop_fw_zone_arg }} --query-rich-rule="$rule" >/dev/null 2>&1; then
+      exit 0
+    fi
+    firewall-cmd --permanent {{ hadoop_fw_zone_arg }} --add-rich-rule="$rule" && echo HADOOP_FW_CHANGED
+  args:
+    executable: /bin/sh
+  loop: "{{ hadoop_host_firewall_ports | product(hadoop_fw_sources) | list }}"
+  loop_control:
+    label: "{{ item.1 }} -> {{ item.0 }}/tcp"
+  register: hadoop_fw_result
+  changed_when: "'HADOOP_FW_CHANGED' in hadoop_fw_result.stdout"
+  notify: hadoop firewalld reload
+  when:
+    - hadoop_fw_firewalld
+    - hadoop_fw_sources | length > 0
+
+# ---------------------------------------------------------------------------
+# ufw (ranges are written "50100:50200")
+# ---------------------------------------------------------------------------
+- name: Firewall | ufw - open ports (any source)
+  ansible.builtin.command:
+    cmd: "ufw allow {{ item | replace('-', ':') }}/tcp"
+  loop: "{{ hadoop_host_firewall_ports }}"
+  register: hadoop_fw_result
+  changed_when: "'Skipping' not in hadoop_fw_result.stdout"
+  when:
+    - hadoop_fw_ufw
+    - hadoop_fw_sources | length == 0
+
+- name: Firewall | ufw - open ports (restricted sources)
+  ansible.builtin.command:
+    cmd: "ufw allow proto tcp from {{ item.1 }} to any port {{ item.0 | replace('-', ':') }}"
+  loop: "{{ hadoop_host_firewall_ports | product(hadoop_fw_sources) | list }}"
+  loop_control:
+    label: "{{ item.1 }} -> {{ item.0 }}/tcp"
+  register: hadoop_fw_result
+  changed_when: "'Skipping' not in hadoop_fw_result.stdout"
+  when:
+    - hadoop_fw_ufw
+    - hadoop_fw_sources | length > 0

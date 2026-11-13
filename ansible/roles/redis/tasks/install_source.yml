@@ -1,0 +1,145 @@
+---
+# Builds the exact redis_version from the upstream tarball and installs it
+# under {{ redis_source_prefix }}/bin. Skipped entirely when that version is
+# already installed, so re-runs are cheap.
+
+- name: Source | currently installed version
+  ansible.builtin.command: "{{ redis_source_prefix }}/bin/redis-server --version"
+  register: __redis_src_current
+  changed_when: false
+  failed_when: false
+
+- name: Source | does it need (re)building
+  ansible.builtin.set_fact:
+    __redis_needs_build: >-
+      {{ __redis_src_current.rc != 0
+         or ('v=' ~ redis_version ~ ' ') not in (__redis_src_current.stdout | default('')) }}
+
+- name: Source | build and install redis {{ redis_version }}
+  when: __redis_needs_build | bool
+  block:
+    - name: Source | build dependencies (Debian)
+      ansible.builtin.apt:
+        name: "{{ __redis_os_build_packages + (__redis_os_build_tls_packages if redis_build_tls | bool else []) }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      register: __redis_build_deps_apt
+      retries: 3
+      delay: 10
+      until: __redis_build_deps_apt is succeeded
+      when: ansible_os_family == 'Debian'
+
+    - name: Source | build dependencies (RedHat)
+      ansible.builtin.package:
+        name: "{{ __redis_os_build_packages + (__redis_os_build_tls_packages if redis_build_tls | bool else []) }}"
+        state: present
+      register: __redis_build_deps_yum
+      retries: 3
+      delay: 10
+      until: __redis_build_deps_yum is succeeded
+      when: ansible_os_family == 'RedHat'
+
+    # Redis >= 6 needs C11 atomics (gcc >= 5). EL7 ships gcc 4.8, so pull a
+    # newer toolchain from Software Collections and build inside `scl enable`.
+    # Best effort: EL7 is EOL and its SCL repos now live on vault.centos.org.
+    - name: Source | newer gcc for EL7 (devtoolset)
+      when:
+        - ansible_os_family == 'RedHat'
+        - ansible_distribution_major_version | int <= 7
+        - (redis_version | string).split('.')[0] | int >= 6
+      block:
+        - name: Source | enable Software Collections repo (EL7)
+          ansible.builtin.package:
+            name: centos-release-scl
+            state: present
+          failed_when: false
+
+        - name: Source | install devtoolset-9 (EL7)
+          ansible.builtin.package:
+            name:
+              - devtoolset-9-gcc
+              - devtoolset-9-gcc-c++
+              - devtoolset-9-make
+            state: present
+          register: __redis_devtoolset
+          failed_when: false
+
+    - name: Source | pick the make command
+      ansible.builtin.set_fact:
+        __redis_make: >-
+          {{ 'scl enable devtoolset-9 -- make'
+             if (__redis_devtoolset is defined and __redis_devtoolset is not skipped
+                 and (__redis_devtoolset.rc | default(0)) == 0 and __redis_devtoolset is not failed)
+             else 'make' }}
+
+    - name: Source | source directory
+      ansible.builtin.file:
+        path: "{{ redis_source_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Source | download redis-{{ redis_version }}.tar.gz
+      ansible.builtin.get_url:
+        url: "{{ redis_source_url }}"
+        dest: "{{ redis_source_dir }}/redis-{{ redis_version }}.tar.gz"
+        checksum: "{{ redis_source_checksum | default(omit, true) }}"
+        owner: root
+        group: root
+        mode: "0644"
+        timeout: 60
+      register: __redis_download
+      retries: 3
+      delay: 10
+      until: __redis_download is succeeded
+
+    # Always start from a pristine tree: a half finished earlier build leaves
+    # stale objects in deps/ that make the next `make` fail in odd ways.
+    - name: Source | remove stale build tree
+      ansible.builtin.file:
+        path: "{{ redis_source_dir }}/redis-{{ redis_version }}"
+        state: absent
+
+    - name: Source | unpack
+      ansible.builtin.unarchive:
+        src: "{{ redis_source_dir }}/redis-{{ redis_version }}.tar.gz"
+        dest: "{{ redis_source_dir }}"
+        remote_src: true
+        owner: root
+        group: root
+
+    - name: Source | compile (this takes a few minutes)
+      ansible.builtin.command:
+        cmd: >-
+          {{ __redis_make }} -j{{ ansible_processor_vcpus | default(2) }}
+          {{ 'BUILD_TLS=yes' if redis_build_tls | bool else '' }}
+        chdir: "{{ redis_source_dir }}/redis-{{ redis_version }}"
+      changed_when: true
+
+    - name: Source | install into {{ redis_source_prefix }}
+      ansible.builtin.command:
+        cmd: "{{ __redis_make }} install PREFIX={{ redis_source_prefix }}"
+        chdir: "{{ redis_source_dir }}/redis-{{ redis_version }}"
+      changed_when: true
+
+    # An upgraded binary only takes effect after a restart. The data-node and
+    # sentinel units are configured in different plays (and the sentinel unit
+    # may not exist yet), so instead of notifying handlers here we leave a
+    # flag that configure.yml / sentinel.yml each consume once.
+    - name: Source | remember that the binaries changed
+      ansible.builtin.set_fact:
+        __redis_binary_changed_data: true
+        __redis_binary_changed_sentinel: true
+
+    - name: Source | verify installed version
+      ansible.builtin.command: "{{ redis_source_prefix }}/bin/redis-server --version"
+      register: __redis_src_verify
+      changed_when: false
+      failed_when: ('v=' ~ redis_version ~ ' ') not in __redis_src_verify.stdout
+
+    - name: Source | clean up build tree
+      ansible.builtin.file:
+        path: "{{ redis_source_dir }}/redis-{{ redis_version }}"
+        state: absent

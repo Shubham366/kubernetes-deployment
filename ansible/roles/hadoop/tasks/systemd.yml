@@ -1,0 +1,58 @@
+---
+# =============================================================================
+# systemd units - one per Hadoop daemon this host runs
+#
+# The daemons run in the foreground (Type=simple, `hdfs namenode` rather than
+# `hdfs --daemon start namenode`), so systemd supervises the JVM directly:
+# no PID files, automatic restart on failure, logs also in the journal.
+# Units are enabled here but started by the orchestration (order matters).
+# =============================================================================
+
+- name: Systemd | Render the Hadoop units
+  ansible.builtin.template:
+    src: hadoop-daemon.service.j2
+    dest: "/etc/systemd/system/{{ hadoop_daemon_defs[item].unit }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ hadoop_host_daemons | difference(['zookeeper']) }}"
+  register: hadoop_units
+  notify: hadoop config changed
+
+- name: Systemd | Reload unit definitions
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: hadoop_units is changed
+
+- name: Systemd | Enable the units at boot
+  ansible.builtin.systemd:
+    name: "{{ hadoop_daemon_defs[item].unit }}.service"
+    enabled: true
+  loop: "{{ hadoop_host_daemons | difference(['zookeeper']) }}"
+
+# After a topology change (e.g. non-HA -> HA drops the SecondaryNameNode) a
+# unit may be left over from a role this host no longer has.
+- name: Systemd | Find units for daemons this host no longer runs
+  ansible.builtin.stat:
+    path: "/etc/systemd/system/{{ hadoop_daemon_defs[item].unit }}.service"
+  loop: "{{ hadoop_daemon_order | difference(['zookeeper']) | difference(hadoop_host_daemons) }}"
+  register: hadoop_stale_units
+
+- name: Systemd | Stop and disable stale units
+  ansible.builtin.systemd:
+    name: "{{ hadoop_daemon_defs[item.item].unit }}.service"
+    state: stopped
+    enabled: false
+  loop: "{{ hadoop_stale_units.results | selectattr('stat', 'defined') | selectattr('stat.exists') | list }}"
+  loop_control:
+    label: "{{ item.item }}"
+  failed_when: false
+
+- name: Systemd | Remove stale unit files
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ hadoop_daemon_defs[item.item].unit }}.service"
+    state: absent
+  loop: "{{ hadoop_stale_units.results | selectattr('stat', 'defined') | selectattr('stat.exists') | list }}"
+  loop_control:
+    label: "{{ item.item }}"
+  notify: hadoop systemd daemon-reload

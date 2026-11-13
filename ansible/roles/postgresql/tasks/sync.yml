@@ -1,0 +1,85 @@
+---
+# Synchronous replication, applied on the primary AFTER the replicas are up.
+#
+# synchronous_standby_names is deliberately not in postgresql.conf: if it were
+# set before a standby is streaming, every commit on the primary (including
+# the role/database creation of this very run) would hang forever. Instead it
+# is set with ALTER SYSTEM once enough standbys are connected, and reset when
+# postgresql_synchronous_replication is false. ALTER SYSTEM itself writes no
+# WAL, so it never waits for a standby.
+
+- name: Sync | load variables
+  ansible.builtin.include_tasks: setup_vars.yml
+
+- name: Sync | current synchronous_standby_names
+  ansible.builtin.command: "{{ __pg_psql }}"
+  args:
+    stdin: "SHOW synchronous_standby_names;"
+  become: true
+  become_user: postgres
+  register: __pg_sync_current
+  changed_when: false
+
+- name: Sync | desired value
+  ansible.builtin.set_fact:
+    __pg_sync_desired: "{{ __pg_sync_standby_names | trim }}"
+
+- name: Sync | plan
+  ansible.builtin.debug:
+    msg: >-
+      synchronous_standby_names: current='{{ __pg_sync_current.stdout | trim }}'
+      desired='{{ __pg_sync_desired }}'
+      {{ '(no change)' if (__pg_sync_current.stdout | trim) == __pg_sync_desired else '' }}
+
+- name: Sync | change synchronous_standby_names
+  when: (__pg_sync_current.stdout | trim) != __pg_sync_desired
+  block:
+    # Refuse to switch synchronous commit on while too few standbys are
+    # streaming: that would block all writes on the primary.
+    - name: Sync | wait for enough streaming standbys
+      ansible.builtin.command: "{{ __pg_psql }}"
+      args:
+        stdin: "SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming';"
+      become: true
+      become_user: postgres
+      register: __pg_sync_streaming
+      changed_when: false
+      retries: 30
+      delay: 5
+      until: (__pg_sync_streaming.stdout | trim | int) >= ([postgresql_synchronous_num | int, __pg_replica_group | length] | min)
+      when: __pg_sync_desired | length > 0
+
+    - name: Sync | ALTER SYSTEM SET synchronous_standby_names
+      ansible.builtin.command: "{{ __pg_psql }}"
+      args:
+        stdin: |
+          ALTER SYSTEM SET synchronous_standby_names = '{{ __pg_sync_desired | replace("'", "''") }}';
+          SELECT pg_reload_conf();
+      become: true
+      become_user: postgres
+      changed_when: true
+      when: __pg_sync_desired | length > 0
+
+    - name: Sync | ALTER SYSTEM RESET synchronous_standby_names
+      ansible.builtin.command: "{{ __pg_psql }}"
+      args:
+        stdin: |
+          ALTER SYSTEM RESET synchronous_standby_names;
+          SELECT pg_reload_conf();
+      become: true
+      become_user: postgres
+      changed_when: true
+      when: __pg_sync_desired | length == 0
+
+- name: Sync | replication overview
+  ansible.builtin.command: "{{ __pg_psql }}"
+  args:
+    stdin: "SELECT application_name || ' ' || client_addr || ' ' || state || ' ' || sync_state FROM pg_stat_replication ORDER BY 1;"
+  become: true
+  become_user: postgres
+  register: __pg_sync_overview
+  changed_when: false
+
+- name: Sync | connected standbys (name address state sync_state)
+  ansible.builtin.debug:
+    msg: "{{ __pg_sync_overview.stdout_lines }}"

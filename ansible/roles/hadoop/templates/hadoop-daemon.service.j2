@@ -1,0 +1,37 @@
+{# Rendered once per daemon; `item` is the daemon name (see hadoop_daemon_defs). #}
+{% set d = hadoop_daemon_defs[item] %}
+# {{ ansible_managed }}
+[Unit]
+Description=Apache Hadoop - {{ d.desc }} ({{ hadoop_cluster_name }})
+Documentation=https://hadoop.apache.org/docs/r{{ hadoop_version }}/
+Wants=network-online.target
+After=network-online.target time-sync.target{{ ' zookeeper.service' if (item in ['zkfc', 'resourcemanager'] and inventory_hostname in hadoop_zk_hosts) else '' }}{{ ' hadoop-namenode.service' if item in ['zkfc', 'secondarynamenode'] else '' }}{{ ' hadoop-journalnode.service' if (item == 'namenode' and hadoop_ha | bool and inventory_hostname in hadoop_jn_hosts) else '' }}
+
+[Service]
+# Foreground JVM supervised directly by systemd (bin/{{ d.bin }} ends in `exec java`).
+Type=simple
+User={{ hadoop_user }}
+Group={{ hadoop_group }}
+Environment=HADOOP_HOME={{ hadoop_current }}
+Environment=HADOOP_CONF_DIR={{ hadoop_conf_dir }}
+Environment=HADOOP_LOG_DIR={{ hadoop_log_dir }}
+# Keep the rolling file appender even though we run in the foreground.
+Environment=HADOOP_ROOT_LOGGER=INFO,RFA
+Environment=HADOOP_LOGFILE=hadoop-{{ hadoop_user }}-{{ d.sub }}-%H.log
+WorkingDirectory={{ hadoop_user_home }}
+ExecStart={{ hadoop_current }}/bin/{{ d.bin }} --config {{ hadoop_conf_dir }} {{ d.sub }}
+# The JVM exits with 143 on SIGTERM - that is a clean stop.
+SuccessExitStatus=143
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=120
+TimeoutStopSec={{ 180 if item in ['namenode', 'datanode'] else 60 }}
+LimitNOFILE={{ hadoop_nofile_limit }}
+LimitNPROC={{ hadoop_nproc_limit }}
+{% if item == 'nodemanager' %}
+# Containers are children of the NodeManager; let it reap them itself.
+KillMode=mixed
+{% endif %}
+
+[Install]
+WantedBy=multi-user.target

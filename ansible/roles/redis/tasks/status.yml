@@ -1,0 +1,158 @@
+---
+# redis_action = status
+# Read-only. Nothing here can fail the play: an unreachable/stopped redis is
+# reported as such. Output is printed with debug so the backend can show it,
+# and a compact summary dict is printed last ("redis_status").
+
+- name: Status | load variables
+  ansible.builtin.include_tasks: setup_vars.yml
+
+# ------------------------------ data node -----------------------------------
+- name: Status | data node
+  when: __redis_is_data_node | bool
+  block:
+    - name: Status | unit state
+      ansible.builtin.command: "systemctl is-active {{ __redis_service }}"
+      register: __redis_st_unit
+      changed_when: false
+      failed_when: false
+
+    - name: Status | unit enabled
+      ansible.builtin.command: "systemctl is-enabled {{ __redis_service }}"
+      register: __redis_st_enabled
+      changed_when: false
+      failed_when: false
+
+    - name: Status | INFO server
+      ansible.builtin.command: "{{ __redis_cli }} info server"
+      environment: "{{ __redis_cli_env }}"
+      register: __redis_st_server
+      changed_when: false
+      failed_when: false
+
+    - name: Status | INFO replication
+      ansible.builtin.command: "{{ __redis_cli }} info replication"
+      environment: "{{ __redis_cli_env }}"
+      register: __redis_st_repl
+      changed_when: false
+      failed_when: false
+
+    - name: Status | INFO memory
+      ansible.builtin.command: "{{ __redis_cli }} info memory"
+      environment: "{{ __redis_cli_env }}"
+      register: __redis_st_mem
+      changed_when: false
+      failed_when: false
+
+    - name: Status | INFO keyspace
+      ansible.builtin.command: "{{ __redis_cli }} info keyspace"
+      environment: "{{ __redis_cli_env }}"
+      register: __redis_st_keys
+      changed_when: false
+      failed_when: false
+
+    - name: Status | print INFO replication
+      ansible.builtin.debug:
+        msg: "{{ (__redis_st_repl.stdout_lines | default([])) or [__redis_st_repl.stderr | default('redis not reachable')] }}"
+
+    - name: Status | cluster
+      when: redis_mode == 'cluster'
+      block:
+        - name: Status | CLUSTER INFO
+          ansible.builtin.command: "{{ __redis_cli }} cluster info"
+          environment: "{{ __redis_cli_env }}"
+          register: __redis_st_cinfo
+          changed_when: false
+          failed_when: false
+
+        - name: Status | CLUSTER NODES
+          ansible.builtin.command: "{{ __redis_cli }} cluster nodes"
+          environment: "{{ __redis_cli_env }}"
+          register: __redis_st_cnodes
+          changed_when: false
+          failed_when: false
+
+        - name: Status | print CLUSTER INFO
+          ansible.builtin.debug:
+            msg: "{{ (__redis_st_cinfo.stdout_lines | default([])) or [__redis_st_cinfo.stderr | default('redis not reachable')] }}"
+
+        - name: Status | print CLUSTER NODES
+          ansible.builtin.debug:
+            msg: "{{ __redis_st_cnodes.stdout_lines | default([]) }}"
+
+    - name: Status | data node summary
+      ansible.builtin.set_fact:
+        __redis_status_data:
+          service: "{{ __redis_service }}"
+          active: "{{ __redis_st_unit.stdout | default('unknown') | trim }}"
+          enabled: "{{ __redis_st_enabled.stdout | default('unknown') | trim }}"
+          reachable: "{{ (__redis_st_repl.rc | default(1)) == 0 and 'role:' in (__redis_st_repl.stdout | default('')) }}"
+          version: "{{ __redis_st_server.stdout | default('') | regex_findall('redis_version:([^\\r\\n]+)') | first | default('unknown') }}"
+          uptime_seconds: "{{ __redis_st_server.stdout | default('') | regex_findall('uptime_in_seconds:([0-9]+)') | first | default('unknown') }}"
+          role: "{{ __redis_st_repl.stdout | default('') | regex_findall('role:(\\w+)') | first | default('unknown') }}"
+          master_host: "{{ __redis_st_repl.stdout | default('') | regex_findall('master_host:([^\\r\\n]+)') | first | default('') }}"
+          master_link_status: "{{ __redis_st_repl.stdout | default('') | regex_findall('master_link_status:(\\w+)') | first | default('') }}"
+          connected_replicas: "{{ __redis_st_repl.stdout | default('') | regex_findall('connected_slaves:([0-9]+)') | first | default('') }}"
+          used_memory_human: "{{ __redis_st_mem.stdout | default('') | regex_findall('used_memory_human:([^\\r\\n]+)') | first | default('unknown') }}"
+          maxmemory_human: "{{ __redis_st_mem.stdout | default('') | regex_findall('maxmemory_human:([^\\r\\n]+)') | first | default('unknown') }}"
+          keyspace: "{{ __redis_st_keys.stdout_lines | default([]) | select('match', '^db[0-9]+:') | list }}"
+          cluster_state: "{{ __redis_st_cinfo.stdout | default('') | regex_findall('cluster_state:(\\w+)') | first | default('') }}"
+          cluster_known_nodes: "{{ __redis_st_cinfo.stdout | default('') | regex_findall('cluster_known_nodes:([0-9]+)') | first | default('') }}"
+          cluster_slots_assigned: "{{ __redis_st_cinfo.stdout | default('') | regex_findall('cluster_slots_assigned:([0-9]+)') | first | default('') }}"
+
+# ------------------------------- sentinel ------------------------------------
+- name: Status | sentinel
+  when:
+    - __redis_is_sentinel | bool
+    - redis_mode == 'sentinel'
+  block:
+    - name: Status | sentinel unit state
+      ansible.builtin.command: "systemctl is-active {{ __redis_sentinel_service }}"
+      register: __redis_st_sunit
+      changed_when: false
+      failed_when: false
+
+    - name: Status | INFO sentinel
+      ansible.builtin.command: "{{ __redis_sentinel_cli }} info sentinel"
+      register: __redis_st_sinfo
+      changed_when: false
+      failed_when: false
+
+    - name: Status | current master according to this sentinel
+      ansible.builtin.command: "{{ __redis_sentinel_cli }} sentinel get-master-addr-by-name {{ redis_sentinel_master_name }}"
+      register: __redis_st_smaster
+      changed_when: false
+      failed_when: false
+
+    - name: Status | quorum check
+      ansible.builtin.command: "{{ __redis_sentinel_cli }} sentinel ckquorum {{ redis_sentinel_master_name }}"
+      register: __redis_st_squorum
+      changed_when: false
+      failed_when: false
+
+    - name: Status | print INFO sentinel
+      ansible.builtin.debug:
+        msg: "{{ (__redis_st_sinfo.stdout_lines | default([])) or [__redis_st_sinfo.stderr | default('sentinel not reachable')] }}"
+
+    - name: Status | sentinel summary
+      ansible.builtin.set_fact:
+        __redis_status_sentinel:
+          service: "{{ __redis_sentinel_service }}"
+          active: "{{ __redis_st_sunit.stdout | default('unknown') | trim }}"
+          master_name: "{{ redis_sentinel_master_name }}"
+          master_addr: "{{ __redis_st_smaster.stdout_lines | default([]) | join(':') }}"
+          quorum: "{{ __redis_st_squorum.stdout | default('') | trim }}"
+          master_line: "{{ __redis_st_sinfo.stdout_lines | default([]) | select('match', '^master[0-9]+:') | list }}"
+
+# -------------------------------- summary ------------------------------------
+- name: Status | redis_status
+  ansible.builtin.debug:
+    msg:
+      redis_status:
+        host: "{{ inventory_hostname }}"
+        address: "{{ __redis_self_addr }}"
+        node_id: "{{ node_id | default('') }}"
+        mode: "{{ redis_mode }}"
+        port: "{{ redis_port }}"
+        data_node: "{{ __redis_status_data | default({}) }}"
+        sentinel: "{{ __redis_status_sentinel | default({}) }}"

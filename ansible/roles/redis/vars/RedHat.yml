@@ -1,0 +1,19 @@
+---
+# RHEL / CentOS / Rocky / Alma specifics
+__redis_os_packages:
+  - redis
+# The sentinel binary ships in the main package on EL.
+__redis_os_sentinel_packages: []
+__redis_os_distro_services:
+  - redis
+  - redis-sentinel
+__redis_os_build_packages:
+  - gcc
+  - make
+  - tar
+  - gzip
+  - pkgconfig
+  - ca-certificates
+__redis_os_build_tls_packages:
+  - openssl-devel
+__redis_os_nologin: /sbin/nologin

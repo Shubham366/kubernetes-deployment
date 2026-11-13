@@ -1,0 +1,21 @@
+---
+# Builds __redis_node_ips: {inventory_hostname: IPv4} for every cluster node.
+#
+# CLUSTER MEET (and therefore `redis-cli --cluster create/add-node`) wants IP
+# addresses. ansible_host may be a DNS name, so each address is resolved on
+# the seed node; an address that already is an IP resolves to itself.
+
+- name: Resolve | look up cluster node addresses
+  ansible.builtin.shell: >-
+    getent ahostsv4 {{ hostvars[item].ansible_host | default(item) | quote }} | awk 'NR==1 {print $1}'
+  loop: "{{ __redis_cluster_group }}"
+  register: __redis_resolve
+  changed_when: false
+  failed_when: __redis_resolve.stdout | trim | length == 0
+
+- name: Resolve | build host -> ip map
+  ansible.builtin.set_fact:
+    __redis_node_ips: "{{ __redis_node_ips | default({}) | combine({item.item: (item.stdout | trim)}) }}"
+  loop: "{{ __redis_resolve.results }}"
+  loop_control:
+    label: "{{ item.item }} -> {{ item.stdout | trim }}"

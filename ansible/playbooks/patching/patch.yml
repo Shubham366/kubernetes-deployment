@@ -1,0 +1,475 @@
+---
+# =============================================================================
+# patch.yml - rolling patch run for Linux hosts
+#
+# Extra vars
+#   target_hosts               host pattern (default: all)
+#   patch_id                   (required) identifier; remote state is kept in
+#                              /var/lib/provisioner/patch/<patch_id>/
+#   patch_mode                 security | all | packages          (default: security)
+#   patch_packages             list of packages (EL: advisory ids allowed) for mode=packages
+#   patch_exclude              list of packages / globs that must not be updated
+#   patch_reboot               never | if_required | always       (default: if_required)
+#   patch_serial               batch size, e.g. 1, 2 or "25%"     (default: 100%)
+#   patch_max_fail_percentage  abort the rollout above this share of failed hosts (default: 0)
+#   patch_dry_run              bool - only report what would change (default: false)
+#   patch_kernel_update        bool - false excludes kernel packages (default: true)
+#   patch_pre_check            bool - run the pre-patch checks      (default: true)
+#   patch_services_to_verify   list of systemd units that must be active afterwards
+#   patch_min_free_mb          free space required on / and /var    (default: 1024)
+#   patch_reboot_timeout       seconds to wait for a reboot         (default: 900)
+#   patch_output_dir           (required) controller-local directory; the final
+#                              report lands at <patch_output_dir>/<inventory_hostname>.json
+#   patch_script_timeout       seconds the patch script may run     (default: 9000)
+#
+# Flow per batch (serial)
+#   pre-check -> package snapshot (packages.before) -> distro patch script ->
+#   reboot according to policy -> post-check -> final report on the controller.
+#
+# The final report is assembled on the controller from the three JSON files the
+# scripts leave in the remote state directory plus what only the playbook
+# knows (rebooted, failures of the play itself). block/rescue/always makes sure
+# a failing host - even an unreachable one - still gets a report with
+# status "failed"; the host is then failed for real so that serial /
+# max_fail_percentage stop the rollout.
+# =============================================================================
+
+- name: Patch Linux hosts
+  hosts: "{{ target_hosts | default('all') }}"
+  serial: "{{ patch_serial | default('100%', true) }}"
+  max_fail_percentage: "{{ patch_max_fail_percentage | default(0) }}"
+  gather_facts: false
+  become: true
+  any_errors_fatal: false
+
+  vars:
+    prov_remote_base: /var/lib/provisioner
+    patch_remote_scripts: "{{ prov_remote_base }}/scripts/patch"
+    patch_scripts_src: "{{ playbook_dir }}/../../scripts/patch"
+
+    patch_id_eff: "{{ patch_id | default('') | string }}"
+    patch_mode_eff: "{{ patch_mode | default('security', true) | string | lower }}"
+    patch_reboot_eff: "{{ patch_reboot | default('if_required', true) | string | lower }}"
+    patch_dry_run_eff: "{{ patch_dry_run | default(false) | bool }}"
+    patch_kernel_eff: "{{ patch_kernel_update | default(true) | bool }}"
+    patch_pre_check_eff: "{{ patch_pre_check | default(true) | bool }}"
+    patch_min_free_eff: "{{ patch_min_free_mb | default(1024) | int }}"
+    patch_reboot_timeout_eff: "{{ patch_reboot_timeout | default(900) | int }}"
+    patch_script_timeout_eff: "{{ patch_script_timeout | default(9000) | int }}"
+
+    # lists may arrive as real lists or as "a,b c" strings
+    patch_packages_list: >-
+      {{ ((patch_packages | default([], true)) if (patch_packages | default([], true)) is not string
+          else ((patch_packages | string | regex_replace('[,\s]+', ' ') | trim).split(' ')))
+         | map('string') | map('trim') | reject('equalto', '') | list }}
+    patch_exclude_list: >-
+      {{ ((patch_exclude | default([], true)) if (patch_exclude | default([], true)) is not string
+          else ((patch_exclude | string | regex_replace('[,\s]+', ' ') | trim).split(' ')))
+         | map('string') | map('trim') | reject('equalto', '') | list }}
+    patch_services_list: >-
+      {{ ((patch_services_to_verify | default([], true)) if (patch_services_to_verify | default([], true)) is not string
+          else ((patch_services_to_verify | string | regex_replace('[,\s]+', ' ') | trim).split(' ')))
+         | map('string') | map('trim') | reject('equalto', '') | list }}
+
+    patch_local_dir: "{{ (patch_output_dir | default('') | string | realpath) if (patch_output_dir | default('') | string | length > 0) else '' }}"
+    patch_local_report: "{{ patch_local_dir }}/{{ inventory_hostname }}.json"
+
+    patch_remote_state: "{{ prov_remote_base }}/patch/{{ patch_id_eff }}"
+    patch_remote_pre: "{{ patch_remote_state }}/pre_check.json"
+    patch_remote_result: "{{ patch_remote_state }}/patch_result.json"
+    patch_remote_post: "{{ patch_remote_state }}/post_check.json"
+
+    patch_family_debian: ['Ubuntu', 'Debian']
+    patch_family_centos: ['CentOS', 'Rocky', 'AlmaLinux', 'OracleLinux', 'Oracle']
+    patch_family_rhel: ['RedHat']
+
+    # state shared between block / rescue / always (overridden with set_fact)
+    patch_script: ""
+    patch_started_at: ""
+    patch_play_failed: false
+    patch_play_errors: []
+    patch_rebooted: false
+    patch_pre_data: {}
+    patch_script_data: {}
+    patch_post_data: {}
+
+  tasks:
+    - name: Patch host
+      block:
+        - name: Record the start time
+          ansible.builtin.set_fact:
+            patch_started_at: "{{ now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ') }}"
+
+        - name: Validate patch parameters
+          ansible.builtin.assert:
+            that:
+              - patch_id is defined
+              - patch_id_eff is match('^[A-Za-z0-9][A-Za-z0-9._-]*$')
+              - patch_output_dir is defined
+              - patch_local_dir | length > 0
+              - patch_mode_eff in ['security', 'all', 'packages']
+              - patch_reboot_eff in ['never', 'if_required', 'always']
+              - patch_mode_eff != 'packages' or (patch_packages_list | length > 0)
+              - patch_min_free_eff | int >= 0
+              - patch_reboot_timeout_eff | int > 0
+            fail_msg: >-
+              Invalid patch parameters: patch_id (letters, digits, '.', '_', '-') and patch_output_dir are
+              required; patch_mode must be security|all|packages (packages needs a non-empty
+              patch_packages list); patch_reboot must be never|if_required|always.
+              Got patch_id='{{ patch_id | default('') }}', patch_mode='{{ patch_mode | default('security') }}',
+              patch_reboot='{{ patch_reboot | default('if_required') }}',
+              patch_packages={{ patch_packages_list | to_json }}.
+            quiet: true
+
+        - name: Ensure the controller output directory exists
+          ansible.builtin.file:
+            path: "{{ patch_local_dir }}"
+            state: directory
+            mode: "0755"
+          delegate_to: localhost
+          become: false
+
+        - name: Gather minimal facts
+          ansible.builtin.setup:
+            gather_subset:
+              - "!all"
+              - min
+          register: patch_setup
+          ignore_unreachable: true
+
+        - name: Fail when the host is unreachable
+          ansible.builtin.fail:
+            msg: >-
+              Host {{ inventory_hostname }} ({{ ansible_host | default('no ansible_host') }}) is unreachable:
+              {{ patch_setup.msg | default('connection failed') }}
+          when: patch_setup.unreachable | default(false)
+
+        - name: Select the patch script for the detected distribution
+          ansible.builtin.set_fact:
+            patch_script: >-
+              {{ 'patch_ubuntu.sh' if ansible_facts.distribution | default('') in patch_family_debian
+                 else 'patch_centos.sh' if ansible_facts.distribution | default('') in patch_family_centos
+                 else 'patch_rhel.sh' if ansible_facts.distribution | default('') in patch_family_rhel
+                 else '' }}
+
+        - name: Fail on unsupported distributions
+          ansible.builtin.fail:
+            msg: >-
+              Unsupported distribution '{{ ansible_facts.distribution | default('unknown') }}
+              {{ ansible_facts.distribution_version | default('') }}' on {{ inventory_hostname }}
+              (declared_os={{ declared_os | default('n/a') }}). Supported: Ubuntu, Debian, CentOS,
+              Rocky, AlmaLinux, Oracle Linux, RedHat.
+          when: patch_script | length == 0
+
+        - name: Create remote working directories
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0750"
+          loop:
+            - "{{ prov_remote_base }}"
+            - "{{ prov_remote_base }}/scripts"
+            - "{{ patch_remote_scripts }}"
+            - "{{ prov_remote_base }}/patch"
+            - "{{ patch_remote_state }}"
+
+        - name: Copy patch scripts to the target
+          ansible.builtin.copy:
+            src: "{{ patch_scripts_src }}/{{ item }}"
+            dest: "{{ patch_remote_scripts }}/{{ item }}"
+            owner: root
+            group: root
+            mode: "0750"
+          loop:
+            - patch_common.sh
+            - pre_patch_check.sh
+            - post_patch_check.sh
+            - "{{ patch_script }}"
+
+        - name: Remove result files of an earlier attempt with the same patch id
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - "{{ patch_remote_pre }}"
+            - "{{ patch_remote_result }}"
+            - "{{ patch_remote_post }}"
+
+        # ------------------------------------------------------------------
+        # 1. pre-check (always records the service / kernel baseline; the
+        #    checks themselves are skipped with patch_pre_check=false)
+        # ------------------------------------------------------------------
+        - name: Run the pre-patch check
+          ansible.builtin.command:
+            argv: >-
+              {{ ['/usr/bin/env', 'bash', patch_remote_scripts ~ '/pre_patch_check.sh',
+                  '--patch-id', patch_id_eff,
+                  '--min-free-mb', patch_min_free_eff | string,
+                  '--output', patch_remote_pre]
+                 + ([] if patch_pre_check_eff else ['--snapshot-only']) }}
+          environment:
+            LC_ALL: C
+            LANG: C
+          async: 1800
+          poll: 5
+          register: patch_pre_run
+          changed_when: false
+          failed_when: patch_pre_run.rc | default(1) != 0
+
+        - name: Read the pre-check result
+          ansible.builtin.slurp:
+            src: "{{ patch_remote_pre }}"
+          register: patch_pre_slurp
+
+        - name: Parse the pre-check result
+          ansible.builtin.set_fact:
+            patch_pre_data: "{{ patch_pre_slurp.content | b64decode | from_json }}"
+
+        - name: Stop when the pre-check did not pass
+          ansible.builtin.fail:
+            msg: >-
+              Pre-patch checks failed on {{ inventory_hostname }}:
+              {{ patch_pre_data.messages | default([]) | select('match', '^FAIL') | list | join(' | ') }}
+          when: not (patch_pre_data.passed | default(false) | bool)
+
+        # ------------------------------------------------------------------
+        # 2. baseline snapshot of installed packages (kept if it already
+        #    exists so that a re-run does not lose the original baseline)
+        # ------------------------------------------------------------------
+        - name: Snapshot the installed package list
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/env
+              - bash
+              - "{{ patch_remote_scripts }}/patch_common.sh"
+              - --snapshot
+              - "{{ patch_remote_state }}/packages.before"
+              - --if-missing
+          register: patch_snapshot_run
+          changed_when: "'snapshot written' in (patch_snapshot_run.stdout | default(''))"
+          when: not patch_dry_run_eff
+
+        # ------------------------------------------------------------------
+        # 3. patch
+        # ------------------------------------------------------------------
+        - name: Run the distro patch script
+          ansible.builtin.command:
+            argv: >-
+              {{ ['/usr/bin/env', 'bash', patch_remote_scripts ~ '/' ~ patch_script,
+                  '--patch-id', patch_id_eff,
+                  '--mode', patch_mode_eff,
+                  '--output', patch_remote_result]
+                 + (['--packages', patch_packages_list | join(' ')] if (patch_mode_eff == 'packages') else [])
+                 + (['--exclude', patch_exclude_list | join(' ')] if (patch_exclude_list | length > 0) else [])
+                 + ([] if patch_kernel_eff else ['--no-kernel'])
+                 + (['--dry-run'] if patch_dry_run_eff else []) }}
+          environment:
+            LC_ALL: C
+            LANG: C
+          async: "{{ patch_script_timeout_eff }}"
+          poll: 15
+          register: patch_run
+          changed_when: not patch_dry_run_eff
+          failed_when: patch_run.rc | default(1) != 0
+
+        - name: Read the patch script result
+          ansible.builtin.slurp:
+            src: "{{ patch_remote_result }}"
+          register: patch_result_slurp
+
+        - name: Parse the patch script result
+          ansible.builtin.set_fact:
+            patch_script_data: "{{ patch_result_slurp.content | b64decode | from_json }}"
+
+        - name: Stop when the patch script reported a failure
+          ansible.builtin.fail:
+            msg: >-
+              Patch script reported status '{{ patch_script_data.status | default('unknown') }}' on
+              {{ inventory_hostname }}:
+              {{ patch_script_data.errors | default([]) | reject('match', '^(WARN|NOTE):') | list | join(' | ') }}
+          when: (patch_script_data.status | default('failed')) not in ['success', 'no_changes', 'dry_run']
+
+        # ------------------------------------------------------------------
+        # 4. reboot according to policy
+        # ------------------------------------------------------------------
+        - name: Reboot the host
+          ansible.builtin.reboot:
+            msg: "Reboot initiated by patch run {{ patch_id_eff }}"
+            reboot_timeout: "{{ patch_reboot_timeout_eff }}"
+            connect_timeout: 20
+            pre_reboot_delay: 2
+            post_reboot_delay: 15
+            test_command: whoami
+          register: patch_reboot_result
+          when:
+            - not patch_dry_run_eff
+            - >-
+              patch_reboot_eff == 'always'
+              or (patch_reboot_eff == 'if_required'
+                  and (patch_script_data.reboot_required | default(false) | bool))
+
+        - name: Remember whether the host was rebooted
+          ansible.builtin.set_fact:
+            patch_rebooted: "{{ patch_reboot_result.rebooted | default(false) | bool }}"
+
+        # ------------------------------------------------------------------
+        # 5. post-check
+        # ------------------------------------------------------------------
+        - name: Run the post-patch check
+          ansible.builtin.command:
+            argv: >-
+              {{ ['/usr/bin/env', 'bash', patch_remote_scripts ~ '/post_patch_check.sh',
+                  '--patch-id', patch_id_eff,
+                  '--output', patch_remote_post]
+                 + (['--services', patch_services_list | join(' ')] if (patch_services_list | length > 0) else [])
+                 + (['--rebooted'] if (patch_rebooted | bool) else [])
+                 + (['--dry-run'] if patch_dry_run_eff else []) }}
+          environment:
+            LC_ALL: C
+            LANG: C
+          async: 1800
+          poll: 5
+          register: patch_post_run
+          changed_when: false
+          failed_when: patch_post_run.rc | default(1) != 0
+
+        - name: Read the post-check result
+          ansible.builtin.slurp:
+            src: "{{ patch_remote_post }}"
+          register: patch_post_slurp
+
+        - name: Parse the post-check result
+          ansible.builtin.set_fact:
+            patch_post_data: "{{ patch_post_slurp.content | b64decode | from_json }}"
+
+        - name: Fail when the post-check did not pass
+          ansible.builtin.fail:
+            msg: >-
+              Post-patch checks failed on {{ inventory_hostname }}:
+              {{ patch_post_data.messages | default([]) | select('match', '^FAIL') | list | join(' | ') }}
+          when: not (patch_post_data.passed | default(false) | bool)
+
+      rescue:
+        - name: Record the failure
+          ansible.builtin.set_fact:
+            patch_play_failed: true
+            patch_play_errors: >-
+              {{ [ (ansible_failed_task.name | default('unknown task')) ~ ': ' ~
+                   (ansible_failed_result.msg
+                    | default(ansible_failed_result.stderr | default('task failed'), true)
+                    | string | truncate(900, true, '...')) ] }}
+
+        - name: Show the tail of the patch script output
+          ansible.builtin.debug:
+            msg: "{{ (patch_run.stderr_lines | default([]))[-20:] }}"
+          when: patch_run is defined and patch_run.stderr_lines is defined
+
+      always:
+        # Whatever happened: collect what the scripts left behind. These tasks
+        # must never abort the report, hence ignore_unreachable / failed_when.
+        - name: Collect the pre-check result
+          ansible.builtin.slurp:
+            src: "{{ patch_remote_pre }}"
+          register: patch_pre_final
+          failed_when: false
+          ignore_unreachable: true
+          when: patch_script | length > 0
+
+        - name: Collect the patch script result
+          ansible.builtin.slurp:
+            src: "{{ patch_remote_result }}"
+          register: patch_result_final
+          failed_when: false
+          ignore_unreachable: true
+          when: patch_script | length > 0
+
+        - name: Collect the post-check result
+          ansible.builtin.slurp:
+            src: "{{ patch_remote_post }}"
+          register: patch_post_final
+          failed_when: false
+          ignore_unreachable: true
+          when: patch_script | length > 0
+
+        - name: Parse the collected pre-check result
+          ansible.builtin.set_fact:
+            patch_pre_data: "{{ patch_pre_final.content | b64decode | from_json }}"
+          when: patch_pre_final.content is defined
+          ignore_errors: true
+
+        - name: Parse the collected patch script result
+          ansible.builtin.set_fact:
+            patch_script_data: "{{ patch_result_final.content | b64decode | from_json }}"
+          when: patch_result_final.content is defined
+          ignore_errors: true
+
+        - name: Parse the collected post-check result
+          ansible.builtin.set_fact:
+            patch_post_data: "{{ patch_post_final.content | b64decode | from_json }}"
+          when: patch_post_final.content is defined
+          ignore_errors: true
+
+        - name: Ensure the controller output directory exists for the final report
+          ansible.builtin.file:
+            path: "{{ patch_local_dir }}"
+            state: directory
+            mode: "0755"
+          delegate_to: localhost
+          become: false
+          when: patch_local_dir | length > 0
+
+        - name: Write the final patch report on the controller
+          ansible.builtin.copy:
+            dest: "{{ patch_local_report }}"
+            mode: "0644"
+            content: |
+              {
+                "schema_version": 1,
+                "patch_id": {{ patch_id_eff | to_json }},
+                "hostname": {{ (patch_script_data.hostname | default(ansible_facts.fqdn | default(ansible_facts.hostname | default(inventory_hostname), true), true)) | string | to_json }},
+                "os": {
+                  "id": {{ (patch_script_data.os.id | default(ansible_facts.distribution | default('unknown') | lower, true)) | string | to_json }},
+                  "version": {{ (patch_script_data.os.version | default(ansible_facts.distribution_version | default(''), true)) | string | to_json }}
+                },
+                "mode": {{ patch_mode_eff | to_json }},
+                "dry_run": {{ (patch_dry_run_eff | bool) | to_json }},
+                "started_at": {{ (patch_script_data.started_at | default(patch_started_at, true) | default(now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ'), true)) | string | to_json }},
+                "finished_at": {{ now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ') | to_json }},
+                "status": {{ patch_final_status | to_json }},
+                "packages_updated": {{ (patch_script_data.packages_updated | default([])) | to_json }},
+                "reboot_required": {{ (patch_post_data.reboot_required | default(patch_script_data.reboot_required | default(false)) | bool) | to_json }},
+                "rebooted": {{ (patch_rebooted | bool) | to_json }},
+                "transaction_id": {{ (patch_script_data.transaction_id | default('')) | string | to_json }},
+                "pre_check": {
+                  "passed": {{ (patch_pre_data.passed | default(not (patch_play_failed | bool)) | bool) | to_json }},
+                  "messages": {{ (patch_pre_data.messages | default(['not executed'] if (patch_play_failed | bool) else [])) | to_json }}
+                },
+                "post_check": {
+                  "passed": {{ (patch_post_data.passed | default(not (patch_play_failed | bool)) | bool) | to_json }},
+                  "messages": {{ (patch_post_data.messages | default(['not executed'] if (patch_play_failed | bool) else [])) | to_json }}
+                },
+                "errors": {{ ((patch_script_data.errors | default([])) + (patch_play_errors | default([]))) | to_json }}
+              }
+          vars:
+            patch_final_status: >-
+              {{ 'failed' if (patch_play_failed | bool)
+                 else (patch_script_data.status | default('failed')) }}
+          delegate_to: localhost
+          become: false
+          when: patch_local_dir | length > 0
+
+        - name: Show patch summary
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }}: status={{ 'failed' if (patch_play_failed | bool) else (patch_script_data.status | default('failed')) }},
+              mode={{ patch_mode_eff }}, dry_run={{ patch_dry_run_eff }},
+              packages={{ patch_script_data.packages_updated | default([]) | length }},
+              rebooted={{ patch_rebooted | bool }},
+              transaction_id='{{ patch_script_data.transaction_id | default('') }}'
+
+        - name: Mark the host as failed when patching did not complete
+          ansible.builtin.fail:
+            msg: "Patching of {{ inventory_hostname }} failed: {{ patch_play_errors | join(' | ') }}"
+          when: patch_play_failed | bool

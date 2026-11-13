@@ -1,0 +1,15 @@
+# {{ ansible_managed }}
+# Login environment for Apache Hadoop ({{ hadoop_cluster_name }})
+{% if hadoop_java_home_resolved is defined %}
+export JAVA_HOME="{{ hadoop_java_home_resolved }}"
+{% endif %}
+export HADOOP_HOME="{{ hadoop_current }}"
+export HADOOP_CONF_DIR="{{ hadoop_conf_dir }}"
+export HADOOP_MAPRED_HOME="$HADOOP_HOME"
+export HADOOP_COMMON_HOME="$HADOOP_HOME"
+export HADOOP_HDFS_HOME="$HADOOP_HOME"
+export HADOOP_YARN_HOME="$HADOOP_HOME"
+case ":$PATH:" in
+  *":$HADOOP_HOME/bin:"*) ;;
+  *) export PATH="$PATH:$HADOOP_HOME/bin:$HADOOP_HOME/sbin" ;;
+esac
