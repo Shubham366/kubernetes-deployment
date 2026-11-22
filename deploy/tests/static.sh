@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tier 1: no cluster needed. Validates every manifest, builds both overlays,
+# Tier 1: no cluster and no git checkout needed (works from a plain copy of the folder). Validates every manifest, builds both overlays,
 # templates every Helm values file, shellchecks the scripts, runs the unit tests.
 #   deploy/tests/static.sh
 # Needs: kubectl, kustomize, helm, kubeconform (or falls back to kubectl
@@ -82,13 +82,20 @@ step "python unit tests"
 python3 -m unittest discover -s "$HERE" -p 'test_*.py' -v 2>&1 | tail -n 15
 [ "${PIPESTATUS[0]}" -eq 0 ] || fail=1
 
-step "secret / junk scan of the git tree"
-# scan only the project that holds deploy/ (works whether it is the repo root or a subfolder)
+step "secret / junk scan of the project tree (no git needed)"
 APP_ROOT="$(cd "$DEPLOY/.." && pwd)"
 cd "$APP_ROOT"
-if git ls-files . | grep -E '(^|/)(data|venv|\.venv)/|\.pem$' ; then echo "  forbidden paths tracked"; fail=1; fi
-if git grep -nE 'BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE KEY|AKIA[0-9A-Z]{16}' -- . ':!*/tests/*' ':!*.md'; then
-  echo "  possible real secret in git"; fail=1
+# a real virtualenv (has pyvenv.cfg) is the reviewer's own and is skipped
+if find . \( -path ./.git -o -path '*/venv' -o -path '*/.venv' \) -prune -o \
+     \( -name '*.pem' -o -path '*/data/*' \) -print | grep .; then
+  echo "  forbidden files present"; fail=1
+fi
+for v in venv .venv; do
+  if [ -d "$v" ] && [ ! -f "$v/pyvenv.cfg" ]; then echo "  $v/ is shipped in the tree"; fail=1; fi
+done
+if grep -rnE --exclude-dir=.git --exclude-dir=tests --exclude='*.md' \
+     'BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE KEY|AKIA[0-9A-Z]{16}' .; then
+  echo "  possible real secret in the tree"; fail=1
 fi
 [ $fail -eq 0 ] && echo "  clean"
 

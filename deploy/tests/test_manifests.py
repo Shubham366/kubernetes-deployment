@@ -122,11 +122,16 @@ class DeploymentHardening(unittest.TestCase):
 class NoRealSecretsInGit(unittest.TestCase):
     PLACEHOLDERS = {"REPLACE_ME", "", None}
 
+    SKIP_DIRS = {".git", "data", "venv", ".venv", "__pycache__", "node_modules"}
+
     def tracked(self):
-        out = subprocess.run(["git", "ls-files", "."], cwd=APP, capture_output=True,
-                             text=True, check=True).stdout.split()
-        files = [APP / p for p in out]
-        assert files, "git ls-files returned nothing; is %s inside a git checkout?" % APP
+        """Every file of the project, found by walking the tree (no git needed, so it
+        works from a zip). The same folders .gitignore excludes are skipped."""
+        files = []
+        for root, dirs, names in os.walk(APP):
+            dirs[:] = [d for d in dirs if d not in self.SKIP_DIRS]
+            files.extend(Path(root) / n for n in names)
+        assert files, "no files found under %s" % APP
         return files
 
     def test_secret_manifests_only_carry_placeholders(self):
@@ -147,8 +152,16 @@ class NoRealSecretsInGit(unittest.TestCase):
             self.assertIsNone(pattern.search(path.read_bytes()), "possible secret in %s" % path)
 
     def test_forbidden_paths_not_tracked(self):
-        bad = [p for p in self.tracked() if p.suffix == ".pem" or
-               {"data", "venv", ".venv"} & set(p.relative_to(APP).parts[:-1])]
+        # walk WITHOUT skipping so a data/ or venv/ folder shipped in the tree is caught.
+        # A real virtualenv (has pyvenv.cfg) is the reviewer's own and is ignored.
+        bad = []
+        for root, dirs, names in os.walk(APP):
+            dirs[:] = [d for d in dirs if d != ".git" and not (Path(root) / d / "pyvenv.cfg").exists()]
+            for n in names:
+                p = Path(root) / n
+                rel = p.relative_to(APP).parts[:-1]
+                if p.suffix == ".pem" or {"data", "venv", ".venv"} & set(rel):
+                    bad.append(p)
         self.assertEqual(bad, [])
 
 
