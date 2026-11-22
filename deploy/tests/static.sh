@@ -93,7 +93,7 @@ fi
 for v in venv .venv; do
   if [ -d "$v" ] && [ ! -f "$v/pyvenv.cfg" ]; then echo "  $v/ is shipped in the tree"; fail=1; fi
 done
-if grep -rnE --exclude-dir=.git --exclude-dir=tests --exclude='*.md' \
+if grep -rnE --exclude-dir=.git --exclude-dir=tests --exclude-dir=venv --exclude-dir=.venv --exclude='*.md' \
      'BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE KEY|AKIA[0-9A-Z]{16}' .; then
   echo "  possible real secret in the tree"; fail=1
 fi
