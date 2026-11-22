@@ -83,8 +83,10 @@ python3 -m unittest discover -s "$HERE" -p 'test_*.py' -v 2>&1 | tail -n 15
 [ "${PIPESTATUS[0]}" -eq 0 ] || fail=1
 
 step "secret / junk scan of the git tree"
-cd "$DEPLOY/../.."
-if git ls-files | grep -E '(^|/)(data|venv|\.venv)/|\.pem$' ; then echo "  forbidden paths tracked"; fail=1; fi
+# scan only the project that holds deploy/ (works whether it is the repo root or a subfolder)
+APP_ROOT="$(cd "$DEPLOY/.." && pwd)"
+cd "$APP_ROOT"
+if git ls-files . | grep -E '(^|/)(data|venv|\.venv)/|\.pem$' ; then echo "  forbidden paths tracked"; fail=1; fi
 if git grep -nE 'BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE KEY|AKIA[0-9A-Z]{16}' -- . ':!*/tests/*' ':!*.md'; then
   echo "  possible real secret in git"; fail=1
 fi

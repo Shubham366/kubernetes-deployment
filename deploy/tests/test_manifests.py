@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 
 DEPLOY = Path(__file__).resolve().parents[1]
-REPO = DEPLOY.parents[1]
+APP = DEPLOY.parent  # the project folder that holds deploy/ (repo root or a subfolder)
 OVERLAYS = ["dev", "prod"]
 
 
@@ -123,9 +123,11 @@ class NoRealSecretsInGit(unittest.TestCase):
     PLACEHOLDERS = {"REPLACE_ME", "", None}
 
     def tracked(self):
-        out = subprocess.run(["git", "ls-files", "linux-provision"], cwd=REPO, capture_output=True,
+        out = subprocess.run(["git", "ls-files", "."], cwd=APP, capture_output=True,
                              text=True, check=True).stdout.split()
-        return [REPO / p for p in out]
+        files = [APP / p for p in out]
+        assert files, "git ls-files returned nothing; is %s inside a git checkout?" % APP
+        return files
 
     def test_secret_manifests_only_carry_placeholders(self):
         import yaml  # type: ignore
@@ -146,7 +148,7 @@ class NoRealSecretsInGit(unittest.TestCase):
 
     def test_forbidden_paths_not_tracked(self):
         bad = [p for p in self.tracked() if p.suffix == ".pem" or
-               {"data", "venv", ".venv"} & set(p.relative_to(REPO).parts[:-1])]
+               {"data", "venv", ".venv"} & set(p.relative_to(APP).parts[:-1])]
         self.assertEqual(bad, [])
 
 
