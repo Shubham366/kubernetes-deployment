@@ -56,7 +56,7 @@ class DeploymentHardening(unittest.TestCase):
             c = dep["spec"]["template"]["spec"]["containers"][0]
             for probe in ("startupProbe", "readinessProbe", "livenessProbe"):
                 self.assertIn(probe, c, probe)
-                self.assertEqual(c[probe]["httpGet"]["path"], "/api/v1/health", probe)
+                self.assertEqual(c[probe]["httpGet"]["path"], "/health", probe)
 
     def test_requests_and_limits(self):
         for _, dep in self.deployments():

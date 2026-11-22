@@ -2,8 +2,10 @@
 
 Everything in this folder takes the Python backend in `linux-provision/` from
 zero to a running, TLS-fronted API on a kOps cluster in AWS, installed by Helm
-and kept in sync by Argo CD. Nothing here changes the application except the
-`Dockerfile` and a `/api/v1/health` alias for the probes.
+and kept in sync by Argo CD. Nothing here changes the application: the only file added outside `deploy/`
+is the `Dockerfile`. The deploy layer depends on the container contract only
+(image, port 8080, unauthenticated `GET /health`, `PROVISIONER_*` env
+settings, data dir `/data`, SSH key at `/etc/provisioner/ssh/id_ed25519`).
 
 ```
 deploy/
@@ -152,7 +154,7 @@ kubectl apply -k linux-provision/deploy/k8s/overlays/prod   # real Ansible runs
 What the base contains: Namespace (restricted Pod Security), ServiceAccount
 (no token automount), ConfigMap of `PROVISIONER_*` settings, PVC (gp3, 5 Gi),
 Deployment (1 replica, `Recreate`, startup/readiness/liveness probes on
-`/api/v1/health`, requests and limits, non-root uid 10001, read-only root fs,
+`/health`, requests and limits, non-root uid 10001, read-only root fs,
 all capabilities dropped, SSH key mounted 0400), ClusterIP Service, Ingress
 with cert-manager TLS, NetworkPolicy (ingress only from ingress-nginx and
 monitoring, egress only DNS and SSH), PodDisruptionBudget.
@@ -162,13 +164,13 @@ Verify:
 ```bash
 kubectl -n provisioner rollout status deploy/provisioner
 kubectl -n provisioner port-forward svc/provisioner 18080:80 &
-curl -s localhost:18080/api/v1/health
+curl -s localhost:18080/health
 curl -s -H "Authorization: Bearer $TOKEN" localhost:18080/api/v1/catalog | head
 ```
 
 Point DNS for the Ingress host (`provisioner.example.com` in prod, edit
 `overlays/prod/patch-ingress.yaml`) at the ingress-nginx NLB, then
-`curl https://provisioner.example.com/api/v1/health`.
+`curl https://provisioner.example.com/health`.
 
 ## Step 5: Argo CD
 
@@ -246,7 +248,7 @@ uses `reclaimPolicy: Delete`; confirm in the EC2 console under Volumes.
    the Deployment into a `Rollout` with a canary step (10 %, 50 %, 100 %)
    behind ingress-nginx traffic splitting, an `AnalysisTemplate` that queries
    the kube-prometheus-stack for 5xx ratio and p95 latency of
-   `/api/v1/health` and job failure rate, automatic rollback on failure, and
+   `/health` and job failure rate, automatic rollback on failure, and
    Argo CD notifications to Slack. Hard parts: this needs feature 1 first
    (two versions sharing one SQLite file is not safe), metrics the app does not
    expose yet, and a load generator so the analysis has data.

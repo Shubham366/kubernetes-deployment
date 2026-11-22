@@ -32,7 +32,7 @@ spec:
       terminationGracePeriodSeconds: 60
       containers:
         - name: provisioner
-          image: ghcr.io/ORG/linux-provision:latest
+          image: ghcr.io/org/linux-provision:latest
           imagePullPolicy: IfNotPresent
           args: ["serve", "--host", "0.0.0.0", "--port", "8080"]
           ports:
@@ -48,15 +48,15 @@ spec:
             - name: HOME
               value: /home/provisioner
           startupProbe:
-            httpGet: {path: /api/v1/health, port: http}
+            httpGet: {path: /health, port: http}
             periodSeconds: 2
             failureThreshold: 30
           readinessProbe:
-            httpGet: {path: /api/v1/health, port: http}
+            httpGet: {path: /health, port: http}
             periodSeconds: 10
             timeoutSeconds: 3
           livenessProbe:
-            httpGet: {path: /api/v1/health, port: http}
+            httpGet: {path: /health, port: http}
             periodSeconds: 20
             timeoutSeconds: 3
             failureThreshold: 3

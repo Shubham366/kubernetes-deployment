@@ -8,7 +8,7 @@ labels:
       environment: dev
     includeSelectors: false
 images:
-  - name: ghcr.io/ORG/linux-provision
+  - name: ghcr.io/org/linux-provision
     newTag: dev
 patches:
   - path: patch-dev.yaml

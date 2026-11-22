@@ -11,7 +11,7 @@ labels:
       environment: prod
     includeSelectors: false
 images:
-  - name: ghcr.io/ORG/linux-provision
+  - name: ghcr.io/org/linux-provision
     newTag: "0.1.0"
 patches:
   - path: patch-ingress.yaml

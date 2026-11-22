@@ -3,14 +3,17 @@
 #   deploy/tests/live.sh            # uses $KUBECONFIG / current context
 #   deploy/tests/live.sh --kind     # creates a kind cluster, builds + loads the image, then tests
 #   KEEP=1 deploy/tests/live.sh --kind   # leave the kind cluster running
-# Applies overlays/dev (dry-run mode, no real hosts), creates throwaway
-# secrets, waits for rollout, and curls /api/v1/health through a port-forward.
+# Applies overlays/dev, creates throwaway secrets, waits for rollout, and
+# checks /health and the bearer-token gate through a port-forward. It knows
+# nothing about the app beyond the container contract.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPLOY="$(cd "$HERE/.." && pwd)"
 APP="$(cd "$DEPLOY/.." && pwd)"
-IMAGE="${IMAGE:-ghcr.io/ORG/linux-provision:dev}"
+IMAGE="${IMAGE:-ghcr.io/org/linux-provision:dev}"
 NS=provisioner
+# any token-protected path of the app; only its status code is checked
+PROTECTED_PATH="${PROTECTED_PATH:-/api/v1/clusters}"
 USE_KIND=0; [ "${1:-}" = "--kind" ] && USE_KIND=1
 for c in kubectl kustomize curl; do command -v "$c" >/dev/null || { echo "missing CLI: $c" >&2; exit 1; }; done
 
@@ -50,29 +53,16 @@ kubectl -n $NS rollout status deployment/provisioner --timeout=180s || {
 echo ">> port-forward + health check"
 kubectl -n $NS port-forward svc/provisioner 18080:80 >/dev/null 2>&1 &
 PF_PID=$!
-for _ in $(seq 1 30); do curl -fsS http://127.0.0.1:18080/api/v1/health >/dev/null 2>&1 && break; sleep 1; done
-HEALTH="$(curl -fsS http://127.0.0.1:18080/api/v1/health)"
+for _ in $(seq 1 30); do curl -fsS http://127.0.0.1:18080/health >/dev/null 2>&1 && break; sleep 1; done
+HEALTH="$(curl -fsS http://127.0.0.1:18080/health)"
 echo "$HEALTH"
 echo "$HEALTH" | grep -q '"status": "ok"' || { echo "health not ok" >&2; exit 1; }
 
 echo ">> auth: no token must be rejected, token must be accepted"
-code_noauth="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/api/v1/clusters)"
-code_auth="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/clusters)"
+code_noauth="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080$PROTECTED_PATH)"
+code_auth="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080$PROTECTED_PATH)"
 echo "  without token: $code_noauth, with token: $code_auth"
 [ "$code_noauth" = "401" ] && [ "$code_auth" = "200" ] || { echo "auth check failed" >&2; exit 1; }
-
-echo ">> dry-run job end to end (cluster create + ping)"
-curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  --data @"$APP/examples/cluster_mixed.json" http://127.0.0.1:18080/api/v1/clusters >/dev/null
-JOB="$(curl -fsS -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/clusters/analytics/ping \
-  | python3 -c 'import sys,json; print(json.load(sys.stdin)["job"]["id"])')"
-for _ in $(seq 1 30); do
-  STATE="$(curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/jobs/$JOB \
-    | python3 -c 'import sys,json; print(json.load(sys.stdin)["job"]["state"])')"
-  case "$STATE" in succeeded|failed|cancelled) break;; esac; sleep 1
-done
-echo "  job $JOB -> $STATE"
-[ "$STATE" = "succeeded" ] || exit 1
 
 echo ">> pod runs as non-root with the key mounted 0400"
 kubectl -n $NS exec deploy/provisioner -- sh -c 'id -u; ls -l /etc/provisioner/ssh/ | tail -n +2'
