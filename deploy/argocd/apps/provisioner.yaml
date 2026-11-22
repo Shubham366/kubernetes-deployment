@@ -1,0 +1,30 @@
+# The provisioner itself, from the Kustomize overlay. Switch path to
+# overlays/prod for the production cluster.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: provisioner
+  namespace: argocd
+  finalizers: [resources-finalizer.argocd.argoproj.io]
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  project: linux-provision
+  source:
+    repoURL: https://github.com/ORG/REPO.git
+    targetRevision: main
+    path: linux-provision/deploy/k8s/overlays/dev
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: provisioner
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - PruneLast=true
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers: [/spec/replicas]

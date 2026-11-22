@@ -1,0 +1,42 @@
+# Small footprint for a 2-node learning cluster.
+fullnameOverride: monitoring
+alertmanager:
+  enabled: true
+  alertmanagerSpec:
+    resources:
+      requests: {cpu: 10m, memory: 64Mi}
+grafana:
+  enabled: true
+  adminPassword: ""        # empty -> chart generates one; read it with:
+                           # kubectl -n monitoring get secret monitoring-grafana -o jsonpath='{.data.admin-password}' | base64 -d
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {memory: 256Mi}
+  sidecar:
+    dashboards:
+      enabled: true
+prometheus:
+  prometheusSpec:
+    retention: 3d
+    resources:
+      requests: {cpu: 200m, memory: 512Mi}
+      limits: {memory: 1Gi}
+    # pick up ServiceMonitors from every namespace, not only release-labelled ones
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 10Gi
+kubeEtcd:
+  enabled: false   # kOps etcd is not reachable from pods
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: false

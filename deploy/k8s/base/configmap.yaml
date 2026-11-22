@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: provisioner-config
+  namespace: provisioner
+data:
+  # Every key maps to a PROVISIONER_<UPPER> setting in provisioner/config.py.
+  PROVISIONER_DATA_DIR: /data
+  PROVISIONER_API_HOST: "0.0.0.0"
+  PROVISIONER_API_PORT: "8080"
+  PROVISIONER_LOG_LEVEL: INFO
+  PROVISIONER_DRY_RUN: "false"
+  PROVISIONER_SIMULATE_WHEN_ANSIBLE_MISSING: "false"
+  PROVISIONER_MAX_WORKERS: "4"
+  PROVISIONER_JOB_TIMEOUT_SECONDS: "14400"
+  PROVISIONER_ANSIBLE_FORKS: "20"
+  PROVISIONER_DEFAULT_SSH_USER: ubuntu
+  PROVISIONER_DEFAULT_SSH_PORT: "22"
+  PROVISIONER_DEFAULT_SSH_KEY_PATH: /etc/provisioner/ssh/id_ed25519
+  ANSIBLE_LOCAL_TEMP: /tmp/ansible
+  ANSIBLE_HOST_KEY_CHECKING: "False"

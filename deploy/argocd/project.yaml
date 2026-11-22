@@ -1,0 +1,27 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: linux-provision
+  namespace: argocd
+  finalizers: [resources-finalizer.argocd.argoproj.io]
+spec:
+  description: Linux provisioning backend and the cluster components it needs
+  sourceRepos:
+    - https://github.com/ORG/REPO.git
+    - https://kubernetes.github.io/ingress-nginx
+    - https://charts.jetstack.io
+    - https://kubernetes-sigs.github.io/metrics-server
+    - https://prometheus-community.github.io/helm-charts
+    - https://kubernetes-sigs.github.io/aws-ebs-csi-driver
+    - registry-1.docker.io/bitnamicharts
+  destinations:
+    - namespace: "*"
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  orphanedResources:
+    warn: true

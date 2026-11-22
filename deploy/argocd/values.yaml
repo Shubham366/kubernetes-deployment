@@ -1,0 +1,35 @@
+# Argo CD Helm values (chart argo/argo-cd). Small, single-replica, no HA.
+global:
+  domain: argocd.example.com
+configs:
+  params:
+    server.insecure: "true"   # TLS terminated by ingress-nginx or port-forward
+  cm:
+    kustomize.buildOptions: --enable-helm
+    timeout.reconciliation: 120s
+server:
+  replicas: 1
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {memory: 256Mi}
+  ingress:
+    enabled: false
+controller:
+  replicas: 1
+  resources:
+    requests: {cpu: 250m, memory: 512Mi}
+    limits: {memory: 1Gi}
+repoServer:
+  replicas: 1
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {memory: 512Mi}
+applicationSet:
+  replicas: 1
+redis:
+  resources:
+    requests: {cpu: 20m, memory: 64Mi}
+dex:
+  enabled: false
+notifications:
+  enabled: false

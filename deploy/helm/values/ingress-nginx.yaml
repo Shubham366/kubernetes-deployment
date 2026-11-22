@@ -1,0 +1,18 @@
+controller:
+  replicaCount: 1
+  ingressClassResource:
+    default: true
+  service:
+    type: LoadBalancer
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-type: nlb
+      service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {memory: 256Mi}
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: false   # flip on once kube-prometheus-stack CRDs exist
+  admissionWebhooks:
+    enabled: true

@@ -1,0 +1,97 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: provisioner
+  namespace: provisioner
+  labels:
+    app.kubernetes.io/name: provisioner
+    app.kubernetes.io/component: api
+spec:
+  # SQLite on a single RWO volume: exactly one replica, replaced not rolled.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: provisioner
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: provisioner
+        app.kubernetes.io/component: api
+    spec:
+      serviceAccountName: provisioner
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: provisioner
+          image: ghcr.io/ORG/linux-provision:latest
+          imagePullPolicy: IfNotPresent
+          args: ["serve", "--host", "0.0.0.0", "--port", "8080"]
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: provisioner-config
+            - secretRef:
+                name: provisioner-api-token
+          env:
+            - name: HOME
+              value: /home/provisioner
+          startupProbe:
+            httpGet: {path: /api/v1/health, port: http}
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: {path: /api/v1/health, port: http}
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: {path: /api/v1/health, port: http}
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: ssh-key
+              mountPath: /etc/provisioner/ssh
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: home
+              mountPath: /home/provisioner
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: provisioner-data
+        - name: ssh-key
+          secret:
+            secretName: provisioner-ssh-key
+            defaultMode: 0400
+        - name: tmp
+          emptyDir: {}
+        - name: home
+          emptyDir: {}

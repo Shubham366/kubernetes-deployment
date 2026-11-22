@@ -1,0 +1,8 @@
+replicas: 1
+args:
+  # kOps and kind nodes use self-signed kubelet certs
+  - --kubelet-insecure-tls
+  - --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname
+resources:
+  requests: {cpu: 50m, memory: 64Mi}
+  limits: {memory: 128Mi}

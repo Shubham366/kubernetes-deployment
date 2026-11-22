@@ -1,0 +1,9 @@
+# kOps grants the node IAM role EBS permissions when iam.legacy=false and
+# useServiceAccountExternalPermissions=true (see kops/cluster.yaml).
+controller:
+  replicaCount: 1
+  resources:
+    requests: {cpu: 20m, memory: 64Mi}
+node:
+  tolerateAllTaints: true
+storageClasses: []   # we create gp3 ourselves in extras/storageclass-gp3.yaml

@@ -1,0 +1,13 @@
+# With one replica a PDB cannot keep the app up, but it does make
+# `kubectl drain` wait for the Recreate rollout to finish instead of killing
+# the only pod mid-job. maxUnavailable: 1 keeps drains possible.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: provisioner
+  namespace: provisioner
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: provisioner

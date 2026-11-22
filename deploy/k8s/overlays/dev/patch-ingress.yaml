@@ -1,0 +1,20 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: provisioner
+  namespace: provisioner
+spec:
+  tls:
+    - hosts: [provisioner.dev.local]
+      secretName: provisioner-tls
+  rules:
+    - host: provisioner.dev.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: provisioner
+                port:
+                  name: http

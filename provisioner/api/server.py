@@ -45,6 +45,7 @@ def build_routes() -> List[Tuple[str, "re.Pattern[str]", Handler]]:
 
     # ------------------------------------------------------------ general
     @route("GET", "/health")
+    @route("GET", "/api/v1/health")
     def health(app, p, q, b):
         return 200, {"status": "ok", "version": __version__, "dry_run": app.settings.dry_run,
                      "ansible_available": app.settings.ansible_available()}
@@ -223,7 +224,7 @@ class ApiServer(ThreadingHTTPServer):
             parsed = urlparse(raw_path)
             query = {k: v[-1] for k, v in parse_qs(parsed.query).items()}
             token = self.app.settings.api_token
-            if token and parsed.path != "/health":
+            if token and parsed.path not in ("/health", "/api/v1/health"):
                 supplied = (headers.get("Authorization") or "")
                 expected = "Bearer %s" % token
                 if not hmac.compare_digest(supplied.encode(), expected.encode()):

@@ -1,0 +1,8 @@
+# kind has no gp3; use its default local-path class (null = cluster default).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: provisioner-data
+  namespace: provisioner
+spec:
+  storageClassName: standard
